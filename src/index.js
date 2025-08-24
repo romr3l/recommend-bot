@@ -95,6 +95,7 @@ async function writeBgResultToMessage(client, ctx, statusEmoji, statusWord, line
 function buildObsRow(obsToken, ctx) {
   const o1 = ctx.done.has('1');
   const o2 = ctx.done.has('2');
+  const o3 = ctx.done.has('3');
 
   const b1 = o1
     ? new ButtonBuilder().setCustomId(`obs:view:${obsToken}:1`).setLabel('View Observation 1').setStyle(ButtonStyle.Primary)
@@ -104,8 +105,13 @@ function buildObsRow(obsToken, ctx) {
     ? new ButtonBuilder().setCustomId(`obs:view:${obsToken}:2`).setLabel('View Observation 2').setStyle(ButtonStyle.Primary)
     : new ButtonBuilder().setCustomId(`obs:start:${obsToken}:2`).setLabel('Observation 2').setStyle(ButtonStyle.Secondary);
 
-  return new ActionRowBuilder().addComponents(b1, b2);
+  const b3 = o3
+    ? new ButtonBuilder().setCustomId(`obs:view:${obsToken}:3`).setLabel('View Observation 3').setStyle(ButtonStyle.Primary)
+    : new ButtonBuilder().setCustomId(`obs:start:${obsToken}:3`).setLabel('Observation 3').setStyle(ButtonStyle.Secondary);
+
+  return new ActionRowBuilder().addComponents(b1, b2, b3);
 }
+
 
 // Edit all copies (original + polls) of the recommendation message
 async function editAllObsMessages(client, ctx, { components, embed }) {
@@ -477,7 +483,8 @@ client.on('interactionCreate', async (interaction) => {
       await editAllObsMessages(client, ctx, { components: rows });
 
       // Mirror to polls when both recorded
-      if (ctx.done.has('1') && ctx.done.has('2') && RECRUITMENT_POLLS_CHANNEL_ID) {
+      // Mirror to polls when all three recorded
+if (ctx.done.has('1') && ctx.done.has('2') && ctx.done.has('3') && RECRUITMENT_POLLS_CHANNEL_ID) {
         const firstRef = ctx.msgRefs[0];
         const origCh = await client.channels.fetch(firstRef.channelId).catch(() => null);
         const orig = origCh ? await origCh.messages.fetch(firstRef.msgId).catch(() => null) : null;
