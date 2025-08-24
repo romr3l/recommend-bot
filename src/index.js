@@ -402,12 +402,12 @@ function buildObsRow(obsToken, ctx) {
   const obs2Done = ctx.done.has('2');
 
   const b1 = obs1Done
-    ? new ButtonBuilder().setCustomId(`obs:view:${obsToken}:1`).setLabel('View Observation 1').setStyle(ButtonStyle.Success)
-    : new ButtonBuilder().setCustomId(`obs:start:${obsToken}:1`).setLabel('Observation 1').setStyle(ButtonStyle.Primary);
+    ? new ButtonBuilder().setCustomId(`obs:view:${obsToken}:1`).setLabel('View Observation 1').setStyle(ButtonStyle.Primary)
+    : new ButtonBuilder().setCustomId(`obs:start:${obsToken}:1`).setLabel('Observation 1').setStyle(ButtonStyle.Secondary);
 
   const b2 = obs2Done
-    ? new ButtonBuilder().setCustomId(`obs:view:${obsToken}:2`).setLabel('View Observation 2').setStyle(ButtonStyle.Success)
-    : new ButtonBuilder().setCustomId(`obs:start:${obsToken}:2`).setLabel('Observation 2').setStyle(ButtonStyle.Primary);
+    ? new ButtonBuilder().setCustomId(`obs:view:${obsToken}:2`).setLabel('View Observation 2').setStyle(ButtonStyle.Primary)
+    : new ButtonBuilder().setCustomId(`obs:start:${obsToken}:2`).setLabel('Observation 2').setStyle(ButtonStyle.Secondary);
 
   return new ActionRowBuilder().addComponents(b1, b2);
 }
