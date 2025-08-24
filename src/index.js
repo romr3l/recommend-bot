@@ -16,7 +16,7 @@ const {
   BOT_TOKEN,
   DEPT_GUILD_ID,
   RECOMMEND_CHANNEL_ID,
-  // ALLOWED_ROLE_IDS, // uncomment when you’re ready to gate
+  ALLOWED_ROLE_IDS,  
 } = process.env;
 
 if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN');
@@ -25,7 +25,7 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent // <-- needed for message collectors to read attachments
+    GatewayIntentBits.MessageContent // needed for message collectors to read attachments
   ],
 });
 
@@ -38,12 +38,12 @@ client.on('interactionCreate', async (interaction) => {
     // 1) /recommend → show modal
     if (interaction.isChatInputCommand() && interaction.commandName === 'recommend') {
       // Role gate (enable when ready)
-      // if (ALLOWED_ROLE_IDS) {
-      //   const allowed = new Set(ALLOWED_ROLE_IDS.split(',').map(s => s.trim()));
-      //   const member = await interaction.guild.members.fetch(interaction.user.id);
-      //   const ok = member.roles.cache.some(r => allowed.has(r.id));
-      //   if (!ok) return interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
-      // }
+    if (ALLOWED_ROLE_IDS) {
+       const allowed = new Set(ALLOWED_ROLE_IDS.split(',').map(s => s.trim()));
+       const member = await interaction.guild.members.fetch(interaction.user.id);
+       const ok = member.roles.cache.some(r => allowed.has(r.id));
+        if (!ok) return interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
+       }
 
       const modal = new ModalBuilder()
         .setCustomId('recommend_modal')
@@ -107,23 +107,21 @@ client.on('interactionCreate', async (interaction) => {
           return;
         }
 
-        const requirements = [
-          '• Recommender must be in good standing.',
-          '• Include Safechat proof.',
-          '• Provide a clear reason.',
-        ].join('\n');
+        // Re-upload and show the image inside the embed
+        const fileName = att.name ?? 'proof.png';
+        const file = new AttachmentBuilder(att.url, { name: fileName });
 
         const embed = new EmbedBuilder()
           .setTitle('New LR Recommendation')
           .setColor(0x2ecc71)
-          .setDescription(`**Requirements**\n${requirements}`)
           .addFields(
             { name: 'Recommender', value: recommenderText || `${interaction.user.tag} (${interaction.user})`, inline: false },
             { name: 'LR Username', value: lrUsername, inline: true },
             { name: 'Reason', value: reason || '—', inline: false },
           )
           .setFooter({ text: `Submitted from: ${interaction.guild?.name ?? 'Unknown'}` })
-          .setTimestamp();
+          .setTimestamp()
+          .setImage(`attachment://${fileName}`);
 
         const dest = await client.channels.fetch(RECOMMEND_CHANNEL_ID).catch(() => null);
         if (!dest || dest.type !== ChannelType.GuildText || dest.guildId !== DEPT_GUILD_ID) {
@@ -142,8 +140,12 @@ client.on('interactionCreate', async (interaction) => {
           return;
         }
 
-        const file = new AttachmentBuilder(att.url, { name: att.name ?? 'proof.png' });
         await dest.send({ embeds: [embed], files: [file] });
+
+        // (optional) tidy user proof message if bot can manage messages
+        // if (me.permissionsIn(channel).has(PermissionsBitField.Flags.ManageMessages)) {
+        //   m.delete().catch(() => {});
+        // }
 
         await interaction.followUp({ ephemeral: true, content: '✅ Recommendation sent to the department server. Thanks!' });
       });
@@ -163,4 +165,5 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 client.login(BOT_TOKEN);
+
 
