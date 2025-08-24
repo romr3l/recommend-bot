@@ -40,8 +40,10 @@ const pendingProof = new Map();
 // key = token; value = { msgId, channelId, guildId, lrUsername, selected:Set<string> }
 const bgSessions = new Map();
 
-// observations: token -> { msgId, channelId, guildId, lrUsername, done:Set<'1'|'2'> }
+// observations: token -> { msgId, channelId, guildId, lrUsername, done:Set<'1'|'2'>, data: { '1'?: Obs, '2'?: Obs } }
 const obsSessions = new Map();
+// type Obs = { username: string, date: string, notes: string, issues: string }
+
 
 
 client.once('ready', () => {
@@ -345,20 +347,26 @@ if (interaction.isButton() &&
 
     // 2) Update components depending on result
     if (action === 'pass') {
-      // Add Observation stage buttons
-      const obsToken = crypto.randomUUID();
-      obsSessions.set(obsToken, {
-        msgId: msg.id,
-        channelId: msg.channelId,
-        guildId: msg.guildId,
-        lrUsername: ctx.lrUsername,
-        done: new Set(),
-      });
+    // inside the PASS branch after you get `msg` from writeBgResultToMessage(...)
+const obsToken = crypto.randomUUID();
+obsSessions.set(obsToken, {
+  msgId: msg.id,
+  channelId: msg.channelId,
+  guildId: msg.guildId,
+  lrUsername: ctx.lrUsername,
+  done: new Set(),
+  data: {},
+});
 
-      const obsRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`obs:start:${obsToken}:1`).setLabel('Observation 1').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`obs:start:${obsToken}:2`).setLabel('Observation 2').setStyle(ButtonStyle.Primary),
-      );
+await msg.edit({
+  components: [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`obs:start:${obsToken}:1`).setLabel('Observation 1').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`obs:start:${obsToken}:2`).setLabel('Observation 2').setStyle(ButtonStyle.Primary),
+    ),
+  ],
+});
+
 
       await msg.edit({ components: [obsRow] });
     } else {
@@ -386,17 +394,47 @@ if (interaction.isButton() &&
 
 // ---------- Observation Stage ----------
 
-// Open modal for Observation {index}
+// ---------- Observation Stage (compact: stores data, shows via ephemeral view) ----------
+
+// helper to rebuild the observation button row based on what's done
+function buildObsRow(obsToken, ctx) {
+  const obs1Done = ctx.done.has('1');
+  const obs2Done = ctx.done.has('2');
+
+  const b1 = obs1Done
+    ? new ButtonBuilder().setCustomId(`obs:view:${obsToken}:1`).setLabel('View Observation 1').setStyle(ButtonStyle.Success)
+    : new ButtonBuilder().setCustomId(`obs:start:${obsToken}:1`).setLabel('Observation 1').setStyle(ButtonStyle.Primary);
+
+  const b2 = obs2Done
+    ? new ButtonBuilder().setCustomId(`obs:view:${obsToken}:2`).setLabel('View Observation 2').setStyle(ButtonStyle.Success)
+    : new ButtonBuilder().setCustomId(`obs:start:${obsToken}:2`).setLabel('Observation 2').setStyle(ButtonStyle.Primary);
+
+  return new ActionRowBuilder().addComponents(b1, b2);
+}
+
+// Open modal for Observation {index} (only if not done yet)
 if (interaction.isButton() && interaction.customId.startsWith('obs:start:')) {
   const [, , obsToken, index] = interaction.customId.split(':');
   const ctx = obsSessions.get(obsToken);
-  if (!ctx) {
-    await interaction.reply({ ephemeral: true, content: '❌ Observation session not found.' });
-    return;
-  }
+  if (!ctx) return interaction.reply({ ephemeral: true, content: '❌ Observation session not found.' });
+
   if (ctx.done.has(index)) {
-    await interaction.reply({ ephemeral: true, content: `🔒 Observation ${index} is already recorded.` });
-    return;
+    // already recorded → show the view version
+    const data = ctx.data?.[index];
+    const viewEmbed = new EmbedBuilder()
+      .setTitle(`Observation ${index}`)
+      .setColor(0x43b581) // green-ish
+      .setDescription(
+        [
+          `**Username:** ${data?.username ?? '—'}`,
+          `**Date:** ${data?.date ?? '—'}`,
+          `**Notes:** ${data?.notes ?? '—'}`,
+          `**Issues:** ${data?.issues || 'None'}`,
+        ].join('\n')
+      )
+      .setFooter({ text: `For: ${ctx.lrUsername}` })
+      .setTimestamp();
+    return interaction.reply({ ephemeral: true, embeds: [viewEmbed] });
   }
 
   const modal = new ModalBuilder()
@@ -419,13 +457,38 @@ if (interaction.isButton() && interaction.customId.startsWith('obs:start:')) {
   return;
 }
 
-// Submit Observation modal
+// View Observation {index} (ephemeral)
+if (interaction.isButton() && interaction.customId.startsWith('obs:view:')) {
+  const [, , obsToken, index] = interaction.customId.split(':');
+  const ctx = obsSessions.get(obsToken);
+  if (!ctx || !ctx.done.has(index)) {
+    return interaction.reply({ ephemeral: true, content: '❌ Observation not available yet.' });
+  }
+  const data = ctx.data?.[index];
+  const viewEmbed = new EmbedBuilder()
+    .setTitle(`Observation ${index}`)
+    .setColor(0x43b581)
+    .setDescription(
+      [
+        `**Username:** ${data?.username ?? '—'}`,
+        `**Date:** ${data?.date ?? '—'}`,
+        `**Notes:** ${data?.notes ?? '—'}`,
+        `**Issues:** ${data?.issues || 'None'}`,
+      ].join('\n')
+    )
+    .setFooter({ text: `For: ${ctx.lrUsername}` })
+    .setTimestamp();
+
+  await interaction.reply({ ephemeral: true, embeds: [viewEmbed] });
+  return;
+}
+
+// Submit Observation modal (store data; update buttons; no changes to main embed)
 if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')) {
   const [, , obsToken, index] = interaction.customId.split(':');
   const ctx = obsSessions.get(obsToken);
   if (!ctx) {
-    await interaction.reply({ ephemeral: true, content: '❌ Observation session expired. Please try again.' });
-    return;
+    return interaction.reply({ ephemeral: true, content: '❌ Observation session expired. Please try again.' });
   }
 
   const username = interaction.fields.getTextInputValue('username').trim();
@@ -433,45 +496,22 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')
   const notes = interaction.fields.getTextInputValue('notes').trim().slice(0, 1024);
   const issues = (interaction.fields.getTextInputValue('issues') || '').trim().slice(0, 1024);
 
-  // fetch original message
+  // store
+  ctx.done.add(index);
+  ctx.data = ctx.data || {};
+  ctx.data[index] = { username, date, notes, issues };
+  obsSessions.set(obsToken, ctx);
+
+  // fetch message and update button rows
   const ch = await client.channels.fetch(ctx.channelId).catch(() => null);
   const msg = ch ? await ch.messages.fetch(ctx.msgId).catch(() => null) : null;
   if (!msg) {
-    await interaction.reply({ ephemeral: true, content: '❌ Could not find the recommendation message.' });
-    return;
+    return interaction.reply({ ephemeral: true, content: '❌ Could not find the recommendation message.' });
   }
 
-  // upsert Observation {index} field into the embed
-  const embed = msg.embeds?.[0] ? EmbedBuilder.from(msg.embeds[0]) : new EmbedBuilder();
-  const fields = embed.data.fields ?? [];
+  const rows = [ buildObsRow(obsToken, ctx) ];
 
-  const name = `Observation ${index}`;
-  const value = [
-    `**Username:** ${username}`,
-    `**Date:** ${date}`,
-    `**Notes:** ${notes || '—'}`,
-    `**Issues:** ${issues || 'None'}`,
-  ].join('\n');
-
-  const without = fields.filter(f => (f.name || '') !== name);
-  without.push({ name, value, inline: false });
-  embed.setFields(without);
-
-  // update which obs are done
-  ctx.done.add(index);
-  obsSessions.set(obsToken, ctx);
-
-  // build components: disable completed, keep remaining enabled
-  const obs1Disabled = ctx.done.has('1');
-  const obs2Disabled = ctx.done.has('2');
-
-  const rows = [];
-  rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`obs:start:${obsToken}:1`).setLabel('Observation 1').setStyle(ButtonStyle.Primary).setDisabled(obs1Disabled),
-    new ButtonBuilder().setCustomId(`obs:start:${obsToken}:2`).setLabel('Observation 2').setStyle(ButtonStyle.Primary).setDisabled(obs2Disabled),
-  ));
-
-  // if both done, add Approve/Decline buttons (no-op handlers for now)
+  // if both done, add Approve/Decline (no-op for now)
   if (ctx.done.has('1') && ctx.done.has('2')) {
     rows.push(new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`final:approve:${obsToken}`).setLabel('Approve').setStyle(ButtonStyle.Success),
@@ -479,18 +519,10 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')
     ));
   }
 
-  await msg.edit({ embeds: [embed], components: rows });
-  await interaction.reply({ ephemeral: true, content: `✅ Observation ${index} recorded.` });
+  await msg.edit({ components: rows });
+  await interaction.reply({ ephemeral: true, content: `✅ Observation ${index} recorded. Use the green button to view it.` });
   return;
 }
-
-// Placeholder final stage buttons (wired later)
-if (interaction.isButton() &&
-   (interaction.customId.startsWith('final:approve:') || interaction.customId.startsWith('final:decline:'))) {
-  await interaction.reply({ ephemeral: true, content: 'ℹ️ Final approval logic not implemented yet.' });
-  return;
-}
-
 
   } catch (err) {
     console.error(err);
