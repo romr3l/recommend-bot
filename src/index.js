@@ -1,9 +1,11 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import {
   ActionRowBuilder,
   AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
+  StringSelectMenuBuilder,
   ChannelType,
   Client,
   EmbedBuilder,
@@ -34,6 +36,10 @@ const client = new Client({
 // stash file between slash -> continue -> modal
 // key = token; value = { fileName, url, userId, createdAt }
 const pendingProof = new Map();
+
+// background-check sessions
+// key = token; value = { msgId, channelId, guildId, lrUsername, selected:Set<string> }
+const bgSessions = new Map();
 
 client.once('ready', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
@@ -71,20 +77,18 @@ client.on('interactionCreate', async (interaction) => {
       setTimeout(() => pendingProof.delete(token), 3 * 60_000);
 
       // requirements embed
-     // requirements embed
-const req = [
-  'Hey, Supervisors! Welcome to the Management Recommendations form, here you will be able to recommend some hard working Experienced Staff, please make sure that they follow the following criteria before you officially recommend them.',
-  '',
-  '💄 **Experienced Staff Criteria**',
-  '- Their account must be at least **60-days (2 months) old** in order to be recommended, this is to prevent troll accounts being accepted into the team.',
-  '- They must not have **safe chat** on their account, you may check through the info command or PM them to repeat a working phrase.',
-  '- They must be seen by you for at least **2+ days** in order to be recommended, as recruitment will check for their overall activity in the game.',
-  '- They must be a member in our **communications server**, please type in their user in a chat they are in to see if their user pops up.',
-  '- They must not have any **major history/MR restrictions** with Flawn Salon, the Recruitment Members will be able to check for you before you recommend any. You can DM them, as it is not recommended to ping them anywhere in the MR chat.',
-  '',
-  'If you have any concerns in regards of recommendations, please feel free to DM a member of the Recruitment Department. Have fun recommending!'
-].join('\n');
-
+      const req = [
+        'Hey, Supervisors! Welcome to the Management Recommendations form, here you will be able to recommend some hard working Experienced Staff, please make sure that they follow the following criteria before you officially recommend them.',
+        '',
+        '💄 **Experienced Staff Criteria**',
+        '- Their account must be at least **60-days (2 months) old** in order to be recommended, this is to prevent troll accounts being accepted into the team.',
+        '- They must not have **safe chat** on their account, you may check through the info command or PM them to repeat a working phrase.',
+        '- They must be seen by you for at least **2+ days** in order to be recommended, as recruitment will check for their overall activity in the game.',
+        '- They must be a member in our **communications server**, please type in their user in a chat they are in to see if their user pops up.',
+        '- They must not have any **major history/MR restrictions** with Flawn Salon, the Recruitment Members will be able to check for you before you recommend any. You can DM them, as it is not recommended to ping them anywhere in the MR chat.',
+        '',
+        'If you have any concerns in regards of recommendations, please feel free to DM a member of the Recruitment Department. Have fun recommending!'
+      ].join('\n');
 
       const embed = new EmbedBuilder()
         .setTitle('Recommendation Requirements')
@@ -146,7 +150,7 @@ const req = [
       return interaction.update({ content: '❎ Recommendation cancelled.', embeds: [], components: [] });
     }
 
-    // ---- Modal submit: combine and send ----
+    // ---- Modal submit: combine and send (adds Background check button) ----
     if (interaction.isModalSubmit() && interaction.customId.startsWith('recommend_modal:')) {
       const token = interaction.customId.split(':')[1];
       const stash = pendingProof.get(token);
@@ -175,7 +179,7 @@ const req = [
 
       const file = new AttachmentBuilder(stash.url, { name: stash.fileName });
 
-      const embed = new EmbedBuilder()
+      const recEmbed = new EmbedBuilder()
         .setTitle('Recommendation')
         .setColor(0x2ecc71)
         .addFields(
@@ -187,10 +191,127 @@ const req = [
         .setTimestamp()
         .setImage(`attachment://${stash.fileName}`);
 
-      await dest.send({ embeds: [embed], files: [file] });
+      // Background check button
+      const bgToken = crypto.randomUUID();
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`bg:start:${bgToken}`)
+          .setLabel('Background check')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+      const sent = await dest.send({ embeds: [recEmbed], files: [file], components: [row] });
+
+      // remember for bg flow
+      bgSessions.set(bgToken, {
+        msgId: sent.id,
+        channelId: sent.channelId,
+        guildId: sent.guildId,
+        lrUsername,
+        selected: new Set(),
+      });
 
       pendingProof.delete(token);
       await interaction.reply({ ephemeral: true, content: '✅ Recommendation sent to the department server. Thanks!' });
+      return;
+    }
+
+    // =======================
+    // Background Check Workflow
+    // =======================
+
+    // Start checklist (ephemeral)
+    if (interaction.isButton() && interaction.customId.startsWith('bg:start:')) {
+      const token = interaction.customId.split(':')[2];
+      const ctx = bgSessions.get(token);
+      if (!ctx) return interaction.reply({ ephemeral: true, content: '❌ This recommendation could not be found.' });
+
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId(`bg:menu:${token}`)
+        .setPlaceholder('Select all items that PASS')
+        .setMinValues(0)
+        .setMaxValues(5)
+        .addOptions(
+          { label: '60+ day account age', value: 'age' },
+          { label: 'No Safechat', value: 'safechat' },
+          { label: 'Seen 2+ days by recommender', value: 'seen' },
+          { label: 'In communications server', value: 'comms' },
+          { label: 'No major history/MR restrictions', value: 'history' },
+        );
+
+      const controls = new ActionRowBuilder().addComponents(menu);
+      const submitRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`bg:submit:${token}`).setLabel('Submit').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`bg:cancel:${token}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+      );
+
+      await interaction.reply({
+        ephemeral: true,
+        content: `**Background check for:** \`${ctx.lrUsername}\`\nSelect all that **PASS**, then press **Submit**.`,
+        components: [controls, submitRow]
+      });
+      return;
+    }
+
+    // Update selections
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu:')) {
+      const token = interaction.customId.split(':')[2];
+      const ctx = bgSessions.get(token);
+      if (!ctx) return interaction.reply({ ephemeral: true, content: '❌ Session expired.' });
+
+      ctx.selected = new Set(interaction.values);
+      bgSessions.set(token, ctx);
+      await interaction.update({
+        content: `Selections saved (${ctx.selected.size}/5). Press **Submit** when done.`,
+        components: interaction.message.components
+      });
+      return;
+    }
+
+    // Cancel BG
+    if (interaction.isButton() && interaction.customId.startsWith('bg:cancel:')) {
+      const token = interaction.customId.split(':')[2];
+      bgSessions.delete(token);
+      return interaction.update({ content: '❎ Background check cancelled.', components: [] });
+    }
+
+    // Submit results
+    if (interaction.isButton() && interaction.customId.startsWith('bg:submit:')) {
+      const token = interaction.customId.split(':')[2];
+      const ctx = bgSessions.get(token);
+      if (!ctx) return interaction.update({ content: '❌ Session expired.', components: [] });
+
+      const items = [
+        { key: 'age', label: '60+ day account age' },
+        { key: 'safechat', label: 'No Safechat' },
+        { key: 'seen', label: 'Seen 2+ days by recommender' },
+        { key: 'comms', label: 'In communications server' },
+        { key: 'history', label: 'No major history/MR restrictions' },
+      ];
+
+      const passed = (k) => ctx.selected && ctx.selected.has(k);
+      const lines = items.map(i => `${passed(i.key) ? '✅' : '❌'} ${i.label}`);
+
+      const ch = await client.channels.fetch(ctx.channelId).catch(() => null);
+      const msg = ch ? await ch.messages.fetch(ctx.msgId).catch(() => null) : null;
+      if (!msg) {
+        bgSessions.delete(token);
+        return interaction.update({ content: '❌ Could not find the original message.', components: [] });
+      }
+
+      const allPass = items.every(i => passed(i.key));
+      const result = new EmbedBuilder()
+        .setTitle('Background Check Results')
+        .setColor(allPass ? 0x2ecc71 : 0xed4245)
+        .setDescription(lines.join('\n'))
+        .setFooter({ text: `Reviewed by ${interaction.user.tag}` })
+        .setTimestamp();
+
+      await msg.reply({ embeds: [result] });
+
+      bgSessions.delete(token);
+      await interaction.update({ content: '✅ Submitted.', components: [] });
+      return;
     }
   } catch (err) {
     console.error(err);
@@ -201,3 +322,4 @@ const req = [
 });
 
 client.login(BOT_TOKEN);
+
