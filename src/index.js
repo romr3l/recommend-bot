@@ -131,19 +131,20 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      const file = new AttachmentBuilder(stash.url, { name: stash.fileName });
+     const file = new AttachmentBuilder(stash.url, { name: stash.fileName });
 
-      const embed = new EmbedBuilder()
-        .setTitle('New LR Recommendation')
-        .setColor(0x2ecc71)
-        .addFields(
-          { name: 'Recommender', value: `${interaction.user.tag} (${interaction.user})`, inline: false },
-          { name: 'LR Username', value: lrUsername, inline: true },
-          { name: 'Reason', value: reason || '—', inline: false },
-        )
-        .setFooter({ text: `Submitted from: ${interaction.guild?.name ?? 'Unknown'}` })
-        .setTimestamp()
-        .setImage(`attachment://${stash.fileName}`);
+const embed = new EmbedBuilder()
+  .setTitle('Recommendation')
+  .setColor(0x2ecc71)
+  .addFields(
+    { name: 'Recommender', value: `${interaction.user}`, inline: false },
+    { name: 'LR Username', value: lrUsername, inline: true },
+    { name: 'Reason', value: reason || '—', inline: false },
+  )
+  .setFooter({ text: `Submitted from: ${interaction.guild?.name ?? 'Unknown'}` })
+  .setTimestamp()
+  .setImage(`attachment://${stash.fileName}`);
+
 
       await dest.send({ embeds: [embed], files: [file] });
 
