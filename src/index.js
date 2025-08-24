@@ -216,103 +216,150 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // =======================
-    // Background Check Workflow
-    // =======================
+ // =======================
+// Background Check Workflow (updated: writes into original embed + pass/decline)
+// =======================
 
-    // Start checklist (ephemeral)
-    if (interaction.isButton() && interaction.customId.startsWith('bg:start:')) {
-      const token = interaction.customId.split(':')[2];
-      const ctx = bgSessions.get(token);
-      if (!ctx) return interaction.reply({ ephemeral: true, content: '❌ This recommendation could not be found.' });
+function buildChecklistLines(selectedSet) {
+  const items = [
+    { key: 'age',     label: '60+ day account age' },
+    { key: 'safechat',label: 'No Safechat' },
+    { key: 'seen',    label: 'Seen 2+ days by recommender' },
+    { key: 'comms',   label: 'In communications server' },
+    { key: 'history', label: 'No major history/MR restrictions' },
+  ];
+  const selected = selectedSet ?? new Set();
+  return {
+    items,
+    lines: items.map(i => `${selected.has(i.key) ? '✅' : '❌'} ${i.label}`),
+    allPass: items.every(i => selected.has(i.key)),
+  };
+}
 
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId(`bg:menu:${token}`)
-        .setPlaceholder('Select all items that PASS')
-        .setMinValues(0)
-        .setMaxValues(5)
-        .addOptions(
-          { label: '60+ day account age', value: 'age' },
-          { label: 'No Safechat', value: 'safechat' },
-          { label: 'Seen 2+ days by recommender', value: 'seen' },
-          { label: 'In communications server', value: 'comms' },
-          { label: 'No major history/MR restrictions', value: 'history' },
-        );
+// helper: edit original message's embed and add/update "Background check" field
+async function writeBgResultToMessage(client, ctx, statusEmoji, statusWord, lines) {
+  const ch = await client.channels.fetch(ctx.channelId).catch(() => null);
+  const msg = ch ? await ch.messages.fetch(ctx.msgId).catch(() => null) : null;
+  if (!msg) throw new Error('Original message not found');
 
-      const controls = new ActionRowBuilder().addComponents(menu);
-      const submitRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`bg:submit:${token}`).setLabel('Submit').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`bg:cancel:${token}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
-      );
+  const baseEmbed = msg.embeds?.[0] ? EmbedBuilder.from(msg.embeds[0]) : new EmbedBuilder();
+  const existing = baseEmbed.data.fields ?? [];
 
-      await interaction.reply({
-        ephemeral: true,
-        content: `**Background check for:** \`${ctx.lrUsername}\`\nSelect all that **PASS**, then press **Submit**.`,
-        components: [controls, submitRow]
-      });
-      return;
-    }
+  // remove any previous "Background check" field and append fresh one
+  const nextFields = existing.filter(f => (f.name || '').toLowerCase() !== 'background check');
+  const value = `${statusEmoji} **Background check: ${statusWord}**\n${lines.join('\n')}`;
+  nextFields.push({ name: 'Background check', value, inline: false });
+  baseEmbed.setFields(nextFields);
 
-    // Update selections
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu:')) {
-      const token = interaction.customId.split(':')[2];
-      const ctx = bgSessions.get(token);
-      if (!ctx) return interaction.reply({ ephemeral: true, content: '❌ Session expired.' });
+  // disable the original "Background check" button so it can't be re-run
+  const disabledRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('bg:disabled')
+      .setLabel('Background check')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(true)
+  );
 
-      ctx.selected = new Set(interaction.values);
-      bgSessions.set(token, ctx);
-      await interaction.update({
-        content: `Selections saved (${ctx.selected.size}/5). Press **Submit** when done.`,
-        components: interaction.message.components
-      });
-      return;
-    }
+  await msg.edit({ embeds: [baseEmbed], components: [disabledRow] });
+}
 
-    // Cancel BG
-    if (interaction.isButton() && interaction.customId.startsWith('bg:cancel:')) {
-      const token = interaction.customId.split(':')[2];
-      bgSessions.delete(token);
-      return interaction.update({ content: '❎ Background check cancelled.', components: [] });
-    }
+// Start checklist (ephemeral)
+if (interaction.isButton() && interaction.customId.startsWith('bg:start:')) {
+  const token = interaction.customId.split(':')[2];
+  const ctx = bgSessions.get(token);
+  if (!ctx) {
+    await interaction.reply({ ephemeral: true, content: '❌ This recommendation could not be found.' });
+    return;
+  }
 
-    // Submit results
-    if (interaction.isButton() && interaction.customId.startsWith('bg:submit:')) {
-      const token = interaction.customId.split(':')[2];
-      const ctx = bgSessions.get(token);
-      if (!ctx) return interaction.update({ content: '❌ Session expired.', components: [] });
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`bg:menu:${token}`)
+    .setPlaceholder('Select all items that PASS')
+    .setMinValues(0)
+    .setMaxValues(5)
+    .addOptions(
+      { label: '60+ day account age', value: 'age' },
+      { label: 'No Safechat', value: 'safechat' },
+      { label: 'Seen 2+ days by recommender', value: 'seen' },
+      { label: 'In communications server', value: 'comms' },
+      { label: 'No major history/MR restrictions', value: 'history' },
+    );
 
-      const items = [
-        { key: 'age', label: '60+ day account age' },
-        { key: 'safechat', label: 'No Safechat' },
-        { key: 'seen', label: 'Seen 2+ days by recommender' },
-        { key: 'comms', label: 'In communications server' },
-        { key: 'history', label: 'No major history/MR restrictions' },
-      ];
+  const controls = new ActionRowBuilder().addComponents(menu);
+  const actions = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`bg:pass:${token}`).setLabel('Pass').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`bg:decline:${token}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`bg:cancel:${token}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+  );
 
-      const passed = (k) => ctx.selected && ctx.selected.has(k);
-      const lines = items.map(i => `${passed(i.key) ? '✅' : '❌'} ${i.label}`);
+  // initialize selection set
+  bgSessions.set(token, { ...ctx, selected: ctx.selected ?? new Set() });
 
-      const ch = await client.channels.fetch(ctx.channelId).catch(() => null);
-      const msg = ch ? await ch.messages.fetch(ctx.msgId).catch(() => null) : null;
-      if (!msg) {
-        bgSessions.delete(token);
-        return interaction.update({ content: '❌ Could not find the original message.', components: [] });
-      }
+  await interaction.reply({
+    ephemeral: true,
+    content: `**Background check for:** \`${ctx.lrUsername}\`\nSelect all that **PASS**, then choose **Pass** or **Decline**.`,
+    components: [controls, actions]
+  });
+  return;
+}
 
-      const allPass = items.every(i => passed(i.key));
-      const result = new EmbedBuilder()
-        .setTitle('Background Check Results')
-        .setColor(allPass ? 0x2ecc71 : 0xed4245)
-        .setDescription(lines.join('\n'))
-        .setFooter({ text: `Reviewed by ${interaction.user.tag}` })
-        .setTimestamp();
+// Update selections
+if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu:')) {
+  const token = interaction.customId.split(':')[2];
+  const ctx = bgSessions.get(token);
+  if (!ctx) {
+    await interaction.reply({ ephemeral: true, content: '❌ Session expired.' });
+    return;
+  }
 
-      await msg.reply({ embeds: [result] });
+  ctx.selected = new Set(interaction.values);
+  bgSessions.set(token, ctx);
 
-      bgSessions.delete(token);
-      await interaction.update({ content: '✅ Submitted.', components: [] });
-      return;
-    }
+  const { allPass } = buildChecklistLines(ctx.selected);
+  await interaction.update({
+    content: `Selections saved (${ctx.selected.size}/5). ${allPass ? 'All checks currently passing.' : 'Some checks are not selected.'} Choose **Pass** or **Decline** when ready.`,
+    components: interaction.message.components
+  });
+  return;
+}
+
+// Cancel BG
+if (interaction.isButton() && interaction.customId.startsWith('bg:cancel:')) {
+  const token = interaction.customId.split(':')[2];
+  bgSessions.delete(token);
+  await interaction.update({ content: '❎ Background check cancelled.', components: [] });
+  return;
+}
+
+// Pass / Decline -> write into the original embed and disable button
+if (interaction.isButton() &&
+   (interaction.customId.startsWith('bg:pass:') || interaction.customId.startsWith('bg:decline:'))) {
+
+  const [ , action, token ] = interaction.customId.split(':');
+  const ctx = bgSessions.get(token);
+  if (!ctx) {
+    await interaction.update({ content: '❌ Session expired.', components: [] });
+    return;
+  }
+
+  const { lines } = buildChecklistLines(ctx.selected);
+  const statusWord = action === 'pass' ? 'PASS' : 'FAILED';
+  const statusEmoji = action === 'pass' ? '✅' : '❌';
+
+  try {
+    await writeBgResultToMessage(client, ctx, statusEmoji, statusWord, lines);
+  } catch (e) {
+    console.error(e);
+    await interaction.update({ content: '❌ Could not update the original message.', components: [] });
+    bgSessions.delete(token);
+    return;
+  }
+
+  bgSessions.delete(token);
+  await interaction.update({ content: `✅ Background check **${statusWord}** recorded.`, components: [] });
+  return;
+}
+
   } catch (err) {
     console.error(err);
     if (interaction.isRepliable()) {
