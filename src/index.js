@@ -23,6 +23,7 @@ const {
   RECRUITMENT_POLLS_CHANNEL_ID,
   VOTE_YES_EMOJI,
   VOTE_NO_EMOJI,
+  PING_ROLE_ID, 
 } = process.env;
 
 if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN');
@@ -261,7 +262,12 @@ client.on('interactionCreate', async (interaction) => {
         new ButtonBuilder().setCustomId(`bg:start:${bgToken}`).setLabel('Background check').setStyle(ButtonStyle.Secondary)
       );
 
-      const sent = await dest.send({ embeds: [recEmbed], components: [row] });
+    const sent = await dest.send({
+  content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,  // 👈 ping role here
+  embeds: [recEmbed],
+  components: [row],
+});
+
 
       bgSessions.set(bgToken, {
         msgId: sent.id,
@@ -479,7 +485,12 @@ client.on('interactionCreate', async (interaction) => {
 
         const pollsCh = await client.channels.fetch(RECRUITMENT_POLLS_CHANNEL_ID).catch(() => null);
         if (pollsCh && baseEmbed) {
-          const pollsMsg = await pollsCh.send({ embeds: [baseEmbed], components: rows }).catch(() => null);
+       const pollsMsg = await pollsCh.send({
+  content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,  // 👈 ping role here too
+  embeds: [baseEmbed],
+  components: rows,
+}).catch(() => null);
+
           if (pollsMsg) {
             ctx.msgRefs.push({ channelId: pollsCh.id, msgId: pollsMsg.id });
             obsSessions.set(obsToken, ctx);
