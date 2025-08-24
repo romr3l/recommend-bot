@@ -71,19 +71,20 @@ client.on('interactionCreate', async (interaction) => {
       setTimeout(() => pendingProof.delete(token), 3 * 60_000);
 
       // requirements embed
-      const req = [
-        '**Hey, Supervisors!** Welcome to the Management Recommendations form.',
-        'Please ensure your candidate meets the following before submitting:',
-        '',
-        '💄 **Experienced Staff Criteria**',
-        '• Account is **≥ 90 days** old.',
-        '• **No Safechat** on the account.',
-        '• You have seen them for **2+ days**.',
-        '• They are in the **communications server**.',
-        '• **No major history / MR restrictions** with Flawn Salon.',
-        '',
-        'If you have concerns, DM the Recruitment Department.'
-      ].join('\n');
+     // requirements embed
+const req = [
+  'Hey, Supervisors! Welcome to the Management Recommendations form, here you will be able to recommend some hard working Experienced Staff, please make sure that they follow the following criteria before you officially recommend them.',
+  '',
+  '💄 **Experienced Staff Criteria**',
+  '- Their account must be at least **60-days (2 months) old** in order to be recommended, this is to prevent troll accounts being accepted into the team.',
+  '- They must not have **safe chat** on their account, you may check through the info command or PM them to repeat a working phrase.',
+  '- They must be seen by you for at least **2+ days** in order to be recommended, as recruitment will check for their overall activity in the game.',
+  '- They must be a member in our **communications server**, please type in their user in a chat they are in to see if their user pops up.',
+  '- They must not have any **major history/MR restrictions** with Flawn Salon, the Recruitment Members will be able to check for you before you recommend any. You can DM them, as it is not recommended to ping them anywhere in the MR chat.',
+  '',
+  'If you have any concerns in regards of recommendations, please feel free to DM a member of the Recruitment Department. Have fun recommending!'
+].join('\n');
+
 
       const embed = new EmbedBuilder()
         .setTitle('Recommendation Requirements')
