@@ -2,6 +2,8 @@ import 'dotenv/config';
 import {
   ActionRowBuilder,
   AttachmentBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   ChannelType,
   Client,
   EmbedBuilder,
@@ -25,12 +27,12 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.MessageContent // harmless to keep; not strictly needed now
   ],
 });
 
-// Stash the file from the slash command until the modal is submitted
-// key = interaction.id; value = { fileName, url, userId, createdAt }
+// stash file between slash -> continue -> modal
+// key = token; value = { fileName, url, userId, createdAt }
 const pendingProof = new Map();
 
 client.once('ready', () => {
@@ -39,46 +41,81 @@ client.once('ready', () => {
 
 client.on('interactionCreate', async (interaction) => {
   try {
-    // --- /recommend (expects an Attachment option named "safechat_proof") ---
+    // ---- /recommend (expects Attachment option "safechat_proof") ----
     if (interaction.isChatInputCommand() && interaction.commandName === 'recommend') {
       // role gate
       if (ALLOWED_ROLE_IDS) {
         const allowed = new Set(ALLOWED_ROLE_IDS.split(',').map(s => s.trim()));
         const member = await interaction.guild.members.fetch(interaction.user.id);
-        const ok = member.roles.cache.some(r => allowed.has(r.id));
-        if (!ok) {
-          await interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
-          return;
+        if (!member.roles.cache.some(r => allowed.has(r.id))) {
+          return interaction.reply({ ephemeral: true, content: 'You do not have permission to use this command.' });
         }
       }
 
-      const proof = interaction.options.getAttachment('safechat_proof'); // from slash UI
-      if (!proof) {
-        await interaction.reply({ ephemeral: true, content: '❌ You must upload a Safechat proof image.' });
-        return;
+      const proof = interaction.options.getAttachment('safechat_proof');
+      if (!proof) return interaction.reply({ ephemeral: true, content: '❌ You must upload a Safechat proof image.' });
+
+      const okTypes = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif'];
+      if (proof.size > 8 * 1024 * 1024 || (proof.contentType && !okTypes.includes(proof.contentType))) {
+        return interaction.reply({ ephemeral: true, content: '❌ Proof must be an image ≤ 8MB (png/jpg/webp/gif).' });
       }
 
-      const allowedTypes = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp', 'image/gif'];
-      if (proof.size > 8 * 1024 * 1024 || (proof.contentType && !allowedTypes.includes(proof.contentType))) {
-        await interaction.reply({ ephemeral: true, content: '❌ Proof must be an image ≤ 8MB (png/jpg/webp/gif).' });
-        return;
-      }
-
-      // Stash the attachment
-      const token = interaction.id; // unique per invocation
+      // stash
+      const token = interaction.id;
       pendingProof.set(token, {
         fileName: proof.name ?? 'proof.png',
         url: proof.url,
         userId: interaction.user.id,
         createdAt: Date.now(),
       });
-      // auto-expire in 3 minutes
       setTimeout(() => pendingProof.delete(token), 3 * 60_000);
 
-      // Open the modal for text fields
+      // requirements embed
+      const req = [
+        '**Hey, Supervisors!** Welcome to the Management Recommendations form.',
+        'Please ensure your candidate meets the following before submitting:',
+        '',
+        '💄 **Experienced Staff Criteria**',
+        '• Account is **≥ 90 days** old.',
+        '• **No Safechat** on the account.',
+        '• You have seen them for **2+ days**.',
+        '• They are in the **communications server**.',
+        '• **No major history / MR restrictions** with Flawn Salon.',
+        '',
+        'If you have concerns, DM the Recruitment Department.'
+      ].join('\n');
+
+      const embed = new EmbedBuilder()
+        .setTitle('Recommendation Requirements')
+        .setDescription(req)
+        .setColor(0x5865F2);
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`recommend:continue:${token}`)
+          .setLabel('Continue')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`recommend:cancel:${token}`)
+          .setLabel('Cancel')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+      await interaction.reply({ ephemeral: true, embeds: [embed], components: [row] });
+      return;
+    }
+
+    // ---- Continue -> open modal ----
+    if (interaction.isButton() && interaction.customId.startsWith('recommend:continue:')) {
+      const token = interaction.customId.split(':')[2];
+      const stash = pendingProof.get(token);
+      if (!stash || stash.userId !== interaction.user.id) {
+        return interaction.reply({ ephemeral: true, content: '❌ Session expired. Please run `/recommend` again.' });
+      }
+
       const modal = new ModalBuilder()
         .setCustomId(`recommend_modal:${token}`)
-        .setTitle('LR Recommendation');
+        .setTitle('Recommendation');
 
       const lrInput = new TextInputBuilder()
         .setCustomId('lr_username')
@@ -101,14 +138,20 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // --- Modal submit: combine stashed file + form inputs and send ---
+    // ---- Cancel ----
+    if (interaction.isButton() && interaction.customId.startsWith('recommend:cancel:')) {
+      const token = interaction.customId.split(':')[2];
+      pendingProof.delete(token);
+      return interaction.update({ content: '❎ Recommendation cancelled.', embeds: [], components: [] });
+    }
+
+    // ---- Modal submit: combine and send ----
     if (interaction.isModalSubmit() && interaction.customId.startsWith('recommend_modal:')) {
       const token = interaction.customId.split(':')[1];
       const stash = pendingProof.get(token);
 
       if (!stash || stash.userId !== interaction.user.id) {
-        await interaction.reply({ ephemeral: true, content: '❌ Session expired. Please run `/recommend` again.' });
-        return;
+        return interaction.reply({ ephemeral: true, content: '❌ Session expired. Please run `/recommend` again.' });
       }
 
       const lrUsername = interaction.fields.getTextInputValue('lr_username').trim();
@@ -116,8 +159,7 @@ client.on('interactionCreate', async (interaction) => {
 
       const dest = await client.channels.fetch(RECOMMEND_CHANNEL_ID).catch(() => null);
       if (!dest || dest.type !== ChannelType.GuildText || dest.guildId !== DEPT_GUILD_ID) {
-        await interaction.reply({ ephemeral: true, content: '❌ Destination channel not found or mismatched.' });
-        return;
+        return interaction.reply({ ephemeral: true, content: '❌ Destination channel not found or mismatched.' });
       }
 
       const me = dest.guild.members.me ?? (await dest.guild.members.fetchMe());
@@ -127,24 +169,22 @@ client.on('interactionCreate', async (interaction) => {
         PermissionsBitField.Flags.AttachFiles,
       ]);
       if (!me.permissionsIn(dest).has(needed)) {
-        await interaction.reply({ ephemeral: true, content: '❌ I am missing permissions to post in the destination channel.' });
-        return;
+        return interaction.reply({ ephemeral: true, content: '❌ I am missing permissions to post in the destination channel.' });
       }
 
-     const file = new AttachmentBuilder(stash.url, { name: stash.fileName });
+      const file = new AttachmentBuilder(stash.url, { name: stash.fileName });
 
-const embed = new EmbedBuilder()
-  .setTitle('Recommendation')
-  .setColor(0x2ecc71)
-  .addFields(
-    { name: 'Recommender', value: `${interaction.user}`, inline: false },
-    { name: 'LR Username', value: lrUsername, inline: true },
-    { name: 'Reason', value: reason || '—', inline: false },
-  )
-  .setFooter({ text: `Submitted from: ${interaction.guild?.name ?? 'Unknown'}` })
-  .setTimestamp()
-  .setImage(`attachment://${stash.fileName}`);
-
+      const embed = new EmbedBuilder()
+        .setTitle('Recommendation')
+        .setColor(0x2ecc71)
+        .addFields(
+          { name: 'Recommender', value: `${interaction.user}`, inline: false },
+          { name: 'LR Username', value: lrUsername, inline: true },
+          { name: 'Reason', value: reason || '—', inline: false },
+        )
+        .setFooter({ text: `Submitted from: ${interaction.guild?.name ?? 'Unknown'}` })
+        .setTimestamp()
+        .setImage(`attachment://${stash.fileName}`);
 
       await dest.send({ embeds: [embed], files: [file] });
 
@@ -160,5 +200,3 @@ const embed = new EmbedBuilder()
 });
 
 client.login(BOT_TOKEN);
-
-
