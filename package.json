@@ -1,0 +1,11 @@
+{
+  "name": "recommend-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon --watch src --ext js --exec node src/index.js",
+    "deploy": "node src/deploy-commands.js"
+  }
+}
