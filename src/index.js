@@ -21,7 +21,13 @@ const {
 
 if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN');
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent // <-- needed for message collectors to read attachments
+  ],
+});
 
 client.once('ready', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
@@ -157,3 +163,4 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 client.login(BOT_TOKEN);
+
