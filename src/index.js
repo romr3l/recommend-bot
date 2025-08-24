@@ -217,7 +217,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton() && interaction.customId.startsWith('recommend:cancel:')) {
       const token = interaction.customId.split(':')[2];
       pendingProof.delete(token);
-      return interaction.update({ content: '❎ Recommendation cancelled.', embeds: [], components: [] });
+      return interaction.update({ content: '❌ Recommendation cancelled.', embeds: [], components: [] });
     }
 
     // modal submit -> post recommendation
@@ -278,7 +278,7 @@ client.on('interactionCreate', async (interaction) => {
       });
 
       pendingProof.delete(token);
-      await interaction.reply({ ephemeral: true, content: '✅ Recommendation sent to the department server. Thanks!' });
+      await interaction.reply({ ephemeral: true, content: '✅ Recommendation sent to the Recruitment Department. Thanks!' });
       return;
     }
 
