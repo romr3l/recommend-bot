@@ -392,6 +392,14 @@ function isBgFinalized(originMessageId) {
   return st === 'PASS' || st === 'FAIL';
 }
 
+if (interaction.isButton() && interaction.customId === 'bg:cancel') {
+  await interaction.update({
+    content: '❎ Background check cancelled.',
+    components: []
+  });
+  return;
+}
+
 if (interaction.isButton() && interaction.customId === 'bg:start') {
   const originMessageId = interaction.message.id;
 
@@ -399,7 +407,7 @@ if (interaction.isButton() && interaction.customId === 'bg:start') {
   if (isBgFinalized(originMessageId)) {
     return interaction.reply({
       ephemeral: true,
-      content: '⚠️ This background check was already finalized.',
+      content: '⚠️ This background check was already completed by someone else..',
     });
   }
 
@@ -416,7 +424,7 @@ if (interaction.isButton() && interaction.customId === 'bg:start') {
       { label: 'No major history/MR restrictions', value: 'history' },
     );
 
-  // Start with ONLY the menu (no Pass/Decline yet)
+  // start with ONLY the menu
   await interaction.reply({
     ephemeral: true,
     content: '**Background check**\nSelect all that **PASS**. Buttons will appear once you make a selection.',
@@ -424,6 +432,7 @@ if (interaction.isButton() && interaction.customId === 'bg:start') {
   });
   return;
 }
+
 
 if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu:')) {
   const originMessageId = interaction.customId.split(':')[2];
