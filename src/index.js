@@ -352,9 +352,33 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-  /* =========================
-   BACKGROUND CHECK (DB-backed)
+/* =========================
+   BACKGROUND CHECK (DB-backed, with locking)
    ========================= */
+
+// --- simple per-message lock ---
+// key: originMessageId  ->  { userId, startedAt }
+const bgLocks = new Map();
+const BG_LOCK_MS = 5 * 60_000; // 5 minutes
+
+function getBgLock(originMessageId) {
+  const lock = bgLocks.get(originMessageId);
+  if (!lock) return null;
+  // expire stale locks
+  if (Date.now() - lock.startedAt > BG_LOCK_MS) {
+    bgLocks.delete(originMessageId);
+    return null;
+  }
+  return lock;
+}
+
+function setBgLock(originMessageId, userId) {
+  bgLocks.set(originMessageId, { userId, startedAt: Date.now() });
+}
+
+function clearBgLock(originMessageId) {
+  bgLocks.delete(originMessageId);
+}
 
 // helper: build actions row based on how many items are selected
 function buildBgActionsRow(originMessageId, selCount) {
@@ -362,19 +386,31 @@ function buildBgActionsRow(originMessageId, selCount) {
   if (selCount === 5) {
     row.addComponents(
       new ButtonBuilder().setCustomId(`bg:pass:${originMessageId}`).setLabel('Pass').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId('bg:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId(`bg:cancel:${originMessageId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
     );
   } else if (selCount >= 0) { // 0..4
     row.addComponents(
       new ButtonBuilder().setCustomId(`bg:decline:${originMessageId}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId('bg:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+      new ButtonBuilder().setCustomId(`bg:cancel:${originMessageId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
     );
   }
   return row;
 }
 
-if (interaction.isButton() && interaction.customId === 'bg:start') {
+if (interaction.isButton() && interaction.customId === 'bg:start')) {
   const originMessageId = interaction.message.id;
+
+  // lock check
+  const lock = getBgLock(originMessageId);
+  if (lock && lock.userId !== interaction.user.id) {
+    return interaction.reply({
+      ephemeral: true,
+      content: `🚧 Background check is currently being filled by <@${lock.userId}>. Try again in a bit (lock auto-expires after 5 minutes).`,
+    });
+  }
+
+  // grant/refresh lock to this user
+  setBgLock(originMessageId, interaction.user.id);
 
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`bg:menu:${originMessageId}`)
@@ -392,7 +428,7 @@ if (interaction.isButton() && interaction.customId === 'bg:start') {
   // start with ONLY the menu (no Pass/Decline yet)
   await interaction.reply({
     ephemeral: true,
-    content: '**Background check**\nSelect all that **PASS**. Buttons will appear once you make a selection.',
+    content: '**Background check (locked to you)**\nSelect all that **PASS**. Buttons will appear once you make a selection.\n_This lock auto-expires after 5 minutes of inactivity._',
     components: [new ActionRowBuilder().addComponents(menu)],
   });
   return;
@@ -400,6 +436,21 @@ if (interaction.isButton() && interaction.customId === 'bg:start') {
 
 if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu:')) {
   const originMessageId = interaction.customId.split(':')[2];
+
+  // only lock holder may change selections
+  const lock = getBgLock(originMessageId);
+  if (!lock || lock.userId !== interaction.user.id) {
+    return interaction.reply({
+      ephemeral: true,
+      content: lock
+        ? `🚧 Locked by <@${lock.userId}>. You can’t edit this right now.`
+        : '⚠️ This session is no longer active. Start it again from the message.',
+    });
+  }
+
+  // refresh lock timestamp on activity
+  setBgLock(originMessageId, interaction.user.id);
+
   saveBgSelection(originMessageId, interaction.values);
 
   const count = interaction.values.length;
@@ -411,14 +462,18 @@ if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu
   await interaction.update({
     content:
       count === 5
-        ? `All **5/5** checks selected. You can **Pass**.`
-        : `Selections saved (**${count}/5**). You can **Decline** or keep selecting.`,
+        ? `All **5/5** checks selected. You can **Pass**. (Locked to you)`
+        : `Selections saved (**${count}/5**). You can **Decline** or keep selecting. (Locked to you)`,
     components: rows,
   });
   return;
 }
 
-if (interaction.isButton() && interaction.customId === 'bg:cancel') {
+// Cancel (precise unlock)
+if (interaction.isButton() && interaction.customId.startsWith('bg:cancel:')) {
+  const originMessageId = interaction.customId.split(':')[2];
+  const lock = getBgLock(originMessageId);
+  if (lock && lock.userId === interaction.user.id) clearBgLock(originMessageId);
   await interaction.update({ content: '❎ Background check cancelled.', components: [] });
   return;
 }
@@ -428,6 +483,18 @@ if (
   (interaction.customId.startsWith('bg:pass:') || interaction.customId.startsWith('bg:decline:'))
 ) {
   const [, action, originMessageId] = interaction.customId.split(':');
+
+  // only lock holder may submit
+  const lock = getBgLock(originMessageId);
+  if (!lock || lock.userId !== interaction.user.id) {
+    return interaction.reply({
+      ephemeral: true,
+      content: lock
+        ? `🚧 Locked by <@${lock.userId}>. You can’t submit this.`
+        : '⚠️ This session is no longer active. Start it again from the message.',
+    });
+  }
+
   const statusWord = action === 'pass' ? 'PASS' : 'FAIL';
   const statusEmoji = action === 'pass' ? '✅' : '❌';
   setBgStatus(originMessageId, statusWord);
@@ -436,6 +503,7 @@ if (
   const ch = interaction.channel;
   const msg = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
   if (!msg) {
+    clearBgLock(originMessageId);
     await interaction.update({ content: '❌ Could not update the original message.', components: [] });
     return;
   }
@@ -460,9 +528,13 @@ if (
     await msg.edit({ embeds: [base], components: [disabledRow] });
   }
 
+  // release the lock on successful submit
+  clearBgLock(originMessageId);
+
   await interaction.update({ content: `✅ Background check **${statusWord}** recorded.`, components: [] });
   return;
 }
+
 
 
 /* =========================
