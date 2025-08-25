@@ -440,146 +440,192 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    /* =========================
-       OBSERVATIONS (3 slots, DB-backed)
-       ========================= */
+/* =========================
+   OBSERVATIONS (3 slots, DB-backed)
+   ========================= */
 
-    // Start (or view if already done)
-    if (interaction.isButton() && interaction.customId.startsWith('obs:start:')) {
-      const [, , originMessageId, idx] = interaction.customId.split(':');
+// Start (or view if already done)
+if (interaction.isButton() && interaction.customId.startsWith('obs:start:')) {
+  const [, , originMessageId, idx] = interaction.customId.split(':');
 
-      // already done? show view
-      const row = getObservation(originMessageId, idx);
-      if (row) {
-        const viewEmbed = new EmbedBuilder()
-          .setTitle(`Observation ${idx}`)
-          .setColor(0x43b581)
-          .setDescription(
-            [
-              `**Username:** ${row.username || '—'}`,
-              `**Date:** ${row.date || '—'}`,
-              `**Notes:** ${row.notes || '—'}`,
-              `**Issues:** ${row.issues || 'None'}`,
-              row.byUserId ? `**By:** <@${row.byUserId}>` : '',
-            ]
-              .filter(Boolean)
-              .join('\n')
-          )
-          .setTimestamp();
-        return interaction.reply({ ephemeral: true, embeds: [viewEmbed] });
+  // already done? show view
+  const row = getObservation(originMessageId, idx);
+  if (row) {
+    // try to read LR username from the original Recommendation embed
+    let lrUsername = '—';
+    try {
+      const refs = getMsgRefs(originMessageId);
+      const originRef = refs.find(r => r.messageId === originMessageId) || refs[0];
+      if (originRef) {
+        const ch = await client.channels.fetch(originRef.channelId).catch(() => null);
+        const origMsg = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
+        const emb = origMsg?.embeds?.[0];
+        const lrField = emb?.fields?.find(f => (f.name || '').toLowerCase() === 'lr username');
+        if (lrField?.value) lrUsername = lrField.value;
       }
+    } catch (_) {}
 
-      const modal = new ModalBuilder().setCustomId(`obs:modal:${originMessageId}:${idx}`).setTitle(`Observation ${idx}`);
+    const todayFallback = new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
 
-      const u = new TextInputBuilder().setCustomId('username').setLabel('Username').setStyle(TextInputStyle.Short).setRequired(true);
-      const d = new TextInputBuilder()
-        .setCustomId('date')
-        .setLabel('Date')
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setPlaceholder('e.g. 08/24/2025');
-      const notes = new TextInputBuilder()
-        .setCustomId('notes')
-        .setLabel('Observation Notes')
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(true);
-      const issues = new TextInputBuilder()
-        .setCustomId('issues')
-        .setLabel('Observation Issues')
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(false);
+    const viewEmbed = new EmbedBuilder()
+      .setTitle(`Observation ${idx}`)
+      .setColor(0x43b581)
+      .addFields(
+        { name: 'Observer', value: row.byUserId ? `<@${row.byUserId}>` : '—', inline: false },
+        { name: 'Date', value: row.date || todayFallback, inline: false },
+        { name: 'Observation Notes', value: row.notes || '—', inline: false },
+        { name: 'Observation Issues', value: row.issues || 'None', inline: false },
+        { name: 'Recommended Individual', value: lrUsername, inline: false }
+      )
+      .setTimestamp();
+    return interaction.reply({ ephemeral: true, embeds: [viewEmbed] });
+  }
 
-      await interaction.showModal(
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(u),
-          new ActionRowBuilder().addComponents(d),
-          new ActionRowBuilder().addComponents(notes),
-          new ActionRowBuilder().addComponents(issues)
-        )
-      );
-      return;
+  // show modal (NOT asking for date/observer anymore)
+  const modal = new ModalBuilder().setCustomId(`obs:modal:${originMessageId}:${idx}`).setTitle(`Observation ${idx}`);
+
+  const notes = new TextInputBuilder()
+    .setCustomId('notes')
+    .setLabel('Observation Notes')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true);
+
+  const issues = new TextInputBuilder()
+    .setCustomId('issues')
+    .setLabel('Observation Issues')
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(false)
+    .setPlaceholder('If none, leave blank');
+
+  await interaction.showModal(
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(notes),
+      new ActionRowBuilder().addComponents(issues)
+    )
+  );
+  return;
+}
+
+// View
+if (interaction.isButton() && interaction.customId.startsWith('obs:view:')) {
+  const [, , originMessageId, idx] = interaction.customId.split(':');
+  const row = getObservation(originMessageId, idx);
+  if (!row) return interaction.reply({ ephemeral: true, content: '❌ Observation not available yet.' });
+
+  // pull LR username from original embed
+  let lrUsername = '—';
+  try {
+    const refs = getMsgRefs(originMessageId);
+    const originRef = refs.find(r => r.messageId === originMessageId) || refs[0];
+    if (originRef) {
+      const ch = await client.channels.fetch(originRef.channelId).catch(() => null);
+      const origMsg = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
+      const emb = origMsg?.embeds?.[0];
+      const lrField = emb?.fields?.find(f => (f.name || '').toLowerCase() === 'lr username');
+      if (lrField?.value) lrUsername = lrField.value;
     }
+  } catch (_) {}
 
-    // View
-    if (interaction.isButton() && interaction.customId.startsWith('obs:view:')) {
-      const [, , originMessageId, idx] = interaction.customId.split(':');
-      const row = getObservation(originMessageId, idx);
-      if (!row) return interaction.reply({ ephemeral: true, content: '❌ Observation not available yet.' });
+  const todayFallback = new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
 
-      const viewEmbed = new EmbedBuilder()
-        .setTitle(`Observation ${idx}`)
-        .setColor(0x43b581)
-        .setDescription(
-          [
-            `**Username:** ${row.username || '—'}`,
-            `**Date:** ${row.date || '—'}`,
-            `**Notes:** ${row.notes || '—'}`,
-            `**Issues:** ${row.issues || 'None'}`,
-            row.byUserId ? `**By:** <@${row.byUserId}>` : '',
-          ]
-            .filter(Boolean)
-            .join('\n')
-        )
-        .setTimestamp();
+  const viewEmbed = new EmbedBuilder()
+    .setTitle(`Observation ${idx}`)
+    .setColor(0x43b581)
+    .addFields(
+      { name: 'Observer', value: row.byUserId ? `<@${row.byUserId}>` : '—', inline: false },
+      { name: 'Date', value: row.date || todayFallback, inline: false },
+      { name: 'Observation Notes', value: row.notes || '—', inline: false },
+      { name: 'Observation Issues', value: row.issues || 'None', inline: false },
+      { name: 'Recommended Individual', value: lrUsername, inline: false }
+    )
+    .setTimestamp();
 
-      await interaction.reply({ ephemeral: true, embeds: [viewEmbed] });
-      return;
-    }
+  await interaction.reply({ ephemeral: true, embeds: [viewEmbed] });
+  return;
+}
 
-    // Modal submit (store; update buttons; mirror if all three done)
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')) {
-      const [, , originMessageId, idx] = interaction.customId.split(':');
+// Modal submit (store; update buttons; mirror if all three done)
+if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')) {
+  const [, , originMessageId, idx] = interaction.customId.split(':');
 
-      const username = interaction.fields.getTextInputValue('username').trim();
-      const date = interaction.fields.getTextInputValue('date').trim();
-      const notes = interaction.fields.getTextInputValue('notes').trim().slice(0, 1024);
-      const issues = (interaction.fields.getTextInputValue('issues') || '').trim().slice(0, 1024);
+  const notes = interaction.fields.getTextInputValue('notes').trim().slice(0, 1024);
+  const issues = (interaction.fields.getTextInputValue('issues') || '').trim().slice(0, 1024);
 
-      saveObservation(originMessageId, idx, {
-        username,
-        date,
-        notes,
-        issues,
-        byUserId: interaction.user.id,
-      });
+  // auto-fill today's date (MM/DD/YYYY)
+  const date = new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
 
-      // refresh all copies (original + any polls)
-      await editAllObsMessagesFromDb(client, originMessageId);
+  saveObservation(originMessageId, idx, {
+    username: null,           // no longer used (Observer is byUserId mention)
+    date,
+    notes,
+    issues,
+    byUserId: interaction.user.id,
+  });
 
-      // Mirror to polls when all three recorded
-      if (haveAllThree(originMessageId) && RECRUITMENT_POLLS_CHANNEL_ID) {
-        try {
-          // fetch the original to reuse its embed
-          const refs = getMsgRefs(originMessageId);
-          const originRef = refs.find((r) => r.messageId === originMessageId) || refs[0];
-          const ch = originRef ? await client.channels.fetch(originRef.channelId).catch(() => null) : null;
-          const orig = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
-          const baseEmbed = orig?.embeds?.[0] ? EmbedBuilder.from(orig.embeds[0]) : null;
+  // refresh all copies (original + any polls)
+  await editAllObsMessagesFromDb(client, originMessageId);
 
-          const pollsCh = await client.channels.fetch(RECRUITMENT_POLLS_CHANNEL_ID).catch(() => null);
-          if (pollsCh && baseEmbed) {
-            const pollsMsg = await pollsCh
-              .send({
-                content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,
-                embeds: [baseEmbed],
-                components: [buildObsRowFromDb(originMessageId)],
-              })
-              .catch(() => null);
+  // Mirror to polls when all three recorded
+  if (haveAllThree(originMessageId) && RECRUITMENT_POLLS_CHANNEL_ID) {
+    try {
+      // fetch the original to reuse its embed
+      const refs = getMsgRefs(originMessageId);
+      const originRef = refs.find((r) => r.messageId === originMessageId) || refs[0];
+      const ch = originRef ? await client.channels.fetch(originRef.channelId).catch(() => null) : null;
+      const orig = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
+      const baseEmbed = orig?.embeds?.[0] ? EmbedBuilder.from(orig.embeds[0]) : null;
 
-            if (pollsMsg) {
-              addMsgRef(originMessageId, pollsCh.id, pollsMsg.id);
-              await reactWith(pollsMsg, VOTE_YES_EMOJI || '✅');
-              await reactWith(pollsMsg, VOTE_NO_EMOJI || '❌');
-            }
-          }
-        } catch (e) {
-          console.error('Polls mirror failed:', e);
+      const pollsCh = await client.channels.fetch(RECRUITMENT_POLLS_CHANNEL_ID).catch(() => null);
+      if (pollsCh && baseEmbed) {
+        const pollsMsg = await pollsCh
+          .send({
+            content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,
+            embeds: [baseEmbed],
+            components: [buildObsRowFromDb(originMessageId)],
+          })
+          .catch(() => null);
+
+        if (pollsMsg) {
+          addMsgRef(originMessageId, pollsCh.id, pollsMsg.id);
+          await reactWith(pollsMsg, VOTE_YES_EMOJI || '✅');
+          await reactWith(pollsMsg, VOTE_NO_EMOJI || '❌');
         }
       }
-
-      await interaction.reply({ ephemeral: true, content: `✅ Observation ${idx} recorded. Use the blue button to view it.` });
-      return;
+    } catch (e) {
+      console.error('Polls mirror failed:', e);
     }
+  }
+
+  // Send a nice confirmation with the same stacked fields
+  let lrUsername = '—';
+  try {
+    const refs = getMsgRefs(originMessageId);
+    const originRef = refs.find(r => r.messageId === originMessageId) || refs[0];
+    if (originRef) {
+      const ch = await client.channels.fetch(originRef.channelId).catch(() => null);
+      const origMsg = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
+      const emb = origMsg?.embeds?.[0];
+      const lrField = emb?.fields?.find(f => (f.name || '').toLowerCase() === 'lr username');
+      if (lrField?.value) lrUsername = lrField.value;
+    }
+  } catch (_) {}
+
+  const confirm = new EmbedBuilder()
+    .setTitle(`Observation ${idx} Recorded`)
+    .setColor(0x43b581)
+    .addFields(
+      { name: 'Observer', value: `<@${interaction.user.id}>`, inline: false },
+      { name: 'Date', value: date, inline: false },
+      { name: 'Observation Notes', value: notes || '—', inline: false },
+      { name: 'Observation Issues', value: issues || 'None', inline: false },
+      { name: 'Recommended Individual', value: lrUsername, inline: false }
+    )
+    .setTimestamp();
+
+  await interaction.reply({ ephemeral: true, embeds: [confirm] });
+  return;
+}
+
   } catch (err) {
     console.error(err);
     if (interaction.isRepliable()) {
