@@ -353,58 +353,55 @@ client.on('interactionCreate', async (interaction) => {
     }
 
 /* =========================
-   BACKGROUND CHECK (DB-backed, with locking)
+   BACKGROUND CHECK (DB-backed)
    ========================= */
 
-// key: originMessageId -> { userId, startedAt }
-const bgLocks = new Map();
-const BG_LOCK_MS = 5 * 60_000; // 5 minutes
-
-function getBgLock(originMessageId) {
-  const lock = bgLocks.get(originMessageId);
-  if (!lock) return null;
-  if (Date.now() - lock.startedAt > BG_LOCK_MS) {
-    bgLocks.delete(originMessageId);
-    return null;
-  }
-  return lock;
-}
-function setBgLock(originMessageId, userId) {
-  bgLocks.set(originMessageId, { userId, startedAt: Date.now() });
-}
-function clearBgLock(originMessageId) {
-  bgLocks.delete(originMessageId);
-}
-
-// Build actions row based on selected count
+// Helper: the actions row depends on how many items are selected
 function buildBgActionsRow(originMessageId, selCount) {
   const row = new ActionRowBuilder();
   if (selCount === 5) {
     row.addComponents(
-      new ButtonBuilder().setCustomId(`bg:pass:${originMessageId}`).setLabel('Pass').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId(`bg:cancel:${originMessageId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`bg:pass:${originMessageId}`)
+        .setLabel('Pass')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId('bg:cancel')
+        .setLabel('Cancel')
+        .setStyle(ButtonStyle.Secondary),
     );
-  } else if (selCount >= 0) { // 0..4
+  } else { // 0..4
     row.addComponents(
-      new ButtonBuilder().setCustomId(`bg:decline:${originMessageId}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId(`bg:cancel:${originMessageId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`bg:decline:${originMessageId}`)
+        .setLabel('Decline')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId('bg:cancel')
+        .setLabel('Cancel')
+        .setStyle(ButtonStyle.Secondary),
     );
   }
   return row;
 }
 
-// Start
+// Small guard helpers (use your existing DB getters)
+function isBgFinalized(originMessageId) {
+  const row = getBg(originMessageId);
+  const st = (row?.status || '').toUpperCase();
+  return st === 'PASS' || st === 'FAIL';
+}
+
 if (interaction.isButton() && interaction.customId === 'bg:start') {
   const originMessageId = interaction.message.id;
 
-  const lock = getBgLock(originMessageId);
-  if (lock && lock.userId !== interaction.user.id) {
+  // If already finalized, stop right away
+  if (isBgFinalized(originMessageId)) {
     return interaction.reply({
       ephemeral: true,
-      content: `🚧 Background check is currently being filled by <@${lock.userId}>. Try again later (auto-expires after 5 minutes).`,
+      content: '⚠️ This background check was already finalized.',
     });
   }
-  setBgLock(originMessageId, interaction.user.id);
 
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`bg:menu:${originMessageId}`)
@@ -416,111 +413,114 @@ if (interaction.isButton() && interaction.customId === 'bg:start') {
       { label: 'No Safechat', value: 'safechat' },
       { label: 'Seen 2+ days by recommender', value: 'seen' },
       { label: 'In communications server', value: 'comms' },
-      { label: 'No major history/MR restrictions', value: 'history' }
+      { label: 'No major history/MR restrictions', value: 'history' },
     );
 
+  // Start with ONLY the menu (no Pass/Decline yet)
   await interaction.reply({
     ephemeral: true,
-    content: '**Background check (locked to you)**\nSelect all that **PASS**. Buttons will appear once you make a selection.\n_This lock auto-expires after 5 minutes of inactivity._',
+    content: '**Background check**\nSelect all that **PASS**. Buttons will appear once you make a selection.',
     components: [new ActionRowBuilder().addComponents(menu)],
   });
   return;
 }
 
-// Selection updates
 if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu:')) {
   const originMessageId = interaction.customId.split(':')[2];
 
-  const lock = getBgLock(originMessageId);
-  if (!lock || lock.userId !== interaction.user.id) {
-    return interaction.reply({
-      ephemeral: true,
-      content: lock
-        ? `🚧 Locked by <@${lock.userId}>. You can’t edit this right now.`
-        : '⚠️ This session is no longer active. Start it again from the message.',
+  // If already finalized, block further edits
+  if (isBgFinalized(originMessageId)) {
+    return interaction.update({
+      content: '⚠️ This background check was already finalized by someone else.',
+      components: [],
     });
   }
-  setBgLock(originMessageId, interaction.user.id); // refresh lock
 
+  // Save current selection
   saveBgSelection(originMessageId, interaction.values);
 
   const count = interaction.values.length;
-  const menuRow = interaction.message.components[0];
+  const menuRow = interaction.message.components[0]; // keep the same menu row
+
+  // Replace/append actions row depending on selection count
   const rows = [menuRow, buildBgActionsRow(originMessageId, count)];
 
   await interaction.update({
     content:
       count === 5
-        ? `All **5/5** checks selected. You can **Pass**. (Locked to you)`
-        : `Selections saved (**${count}/5**). You can **Decline** or keep selecting. (Locked to you)`,
+        ? 'All **5/5** checks selected. You can **Pass**.'
+        : `Selections saved (**${count}/5**). You can **Decline** or keep selecting.`,
     components: rows,
   });
   return;
 }
 
-// Cancel (unlock)
-if (interaction.isButton() && interaction.customId.startsWith('bg:cancel:')) {
-  const originMessageId = interaction.customId.split(':')[2];
-  const lock = getBgLock(originMessageId);
-  if (lock && lock.userId === interaction.user.id) clearBgLock(originMessageId);
+if (interaction.isButton() && interaction.customId === 'bg:cancel')) {
   await interaction.update({ content: '❎ Background check cancelled.', components: [] });
   return;
 }
 
-// Pass / Decline
 if (
   interaction.isButton() &&
   (interaction.customId.startsWith('bg:pass:') || interaction.customId.startsWith('bg:decline:'))
 ) {
   const [, action, originMessageId] = interaction.customId.split(':');
 
-  const lock = getBgLock(originMessageId);
-  if (!lock || lock.userId !== interaction.user.id) {
-    return interaction.reply({
-      ephemeral: true,
-      content: lock
-        ? `🚧 Locked by <@${lock.userId}>. You can’t submit this.`
-        : '⚠️ This session is no longer active. Start it again from the message.',
+  // **FIRST-WINS GUARD**: if someone already submitted, stop here.
+  if (isBgFinalized(originMessageId)) {
+    return interaction.update({
+      content: '⚠️ Someone already finalized this background check.',
+      components: [],
     });
   }
 
-  const statusWord = action === 'pass' ? 'PASS' : 'FAIL';
-  const statusEmoji = action === 'pass' ? '✅' : '❌';
+  const statusWord  = action === 'pass' ? 'PASS' : 'FAIL';
+  const statusEmoji = action === 'pass' ? '✅'   : '❌';
+
+  // Mark finalized in DB
   setBgStatus(originMessageId, statusWord);
 
-  const ch = interaction.channel;
+  // Update original message embed with header "Background Check: PASS/FAIL"
+  const ch  = interaction.channel;
   const msg = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
   if (!msg) {
-    clearBgLock(originMessageId);
     await interaction.update({ content: '❌ Could not update the original message.', components: [] });
     return;
   }
 
-  const bg = getBg(originMessageId);
+  const bg       = getBg(originMessageId);
   const selected = JSON.parse(bg.selected_json || '[]');
-  const lines = buildChecklistLinesFromSelected(selected);
+  const lines    = buildChecklistLinesFromSelected(selected);
 
-  const base = msg.embeds?.[0] ? EmbedBuilder.from(msg.embeds[0]) : new EmbedBuilder();
-  const fields = (base.data.fields ?? []).filter(
-    f => !((f.name || '').toLowerCase().startsWith('background check') || (f.name || '').toLowerCase().includes('background check'))
-  );
-  fields.push({ name: `${statusEmoji} Background Check: ${statusWord}`, value: lines.join('\n'), inline: false });
+  const base   = msg.embeds?.[0] ? EmbedBuilder.from(msg.embeds[0]) : new EmbedBuilder();
+  const fields = (base.data.fields ?? []).filter(f => {
+    const n = (f.name || '').toLowerCase();
+    return !(n.startsWith('background check') || n.includes('background check'));
+  });
+  fields.push({
+    name: `${statusEmoji} Background Check: ${statusWord}`,
+    value: lines.join('\n'),
+    inline: false,
+  });
   base.setFields(fields);
 
   if (action === 'pass') {
     await msg.edit({ embeds: [base], components: [buildObsRowFromDb(originMessageId)] });
   } else {
     const disabledRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('bg:disabled').setLabel('Background check').setStyle(ButtonStyle.Secondary).setDisabled(true)
+      new ButtonBuilder()
+        .setCustomId('bg:disabled')
+        .setLabel('Background check')
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(true),
     );
     await msg.edit({ embeds: [base], components: [disabledRow] });
   }
 
-  clearBgLock(originMessageId);
-
   await interaction.update({ content: `✅ Background check **${statusWord}** recorded.`, components: [] });
   return;
 }
+
 
 
 /* =========================
