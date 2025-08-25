@@ -356,31 +356,27 @@ client.on('interactionCreate', async (interaction) => {
    BACKGROUND CHECK (DB-backed, with locking)
    ========================= */
 
-// --- simple per-message lock ---
-// key: originMessageId  ->  { userId, startedAt }
+// key: originMessageId -> { userId, startedAt }
 const bgLocks = new Map();
 const BG_LOCK_MS = 5 * 60_000; // 5 minutes
 
 function getBgLock(originMessageId) {
   const lock = bgLocks.get(originMessageId);
   if (!lock) return null;
-  // expire stale locks
   if (Date.now() - lock.startedAt > BG_LOCK_MS) {
     bgLocks.delete(originMessageId);
     return null;
   }
   return lock;
 }
-
 function setBgLock(originMessageId, userId) {
   bgLocks.set(originMessageId, { userId, startedAt: Date.now() });
 }
-
 function clearBgLock(originMessageId) {
   bgLocks.delete(originMessageId);
 }
 
-// helper: build actions row based on how many items are selected
+// Build actions row based on selected count
 function buildBgActionsRow(originMessageId, selCount) {
   const row = new ActionRowBuilder();
   if (selCount === 5) {
@@ -397,19 +393,17 @@ function buildBgActionsRow(originMessageId, selCount) {
   return row;
 }
 
-if (interaction.isButton() && interaction.customId === 'bg:start')) {
+// Start
+if (interaction.isButton() && interaction.customId === 'bg:start') {
   const originMessageId = interaction.message.id;
 
-  // lock check
   const lock = getBgLock(originMessageId);
   if (lock && lock.userId !== interaction.user.id) {
     return interaction.reply({
       ephemeral: true,
-      content: `🚧 Background check is currently being filled by <@${lock.userId}>. Try again in a bit (lock auto-expires after 5 minutes).`,
+      content: `🚧 Background check is currently being filled by <@${lock.userId}>. Try again later (auto-expires after 5 minutes).`,
     });
   }
-
-  // grant/refresh lock to this user
   setBgLock(originMessageId, interaction.user.id);
 
   const menu = new StringSelectMenuBuilder()
@@ -425,7 +419,6 @@ if (interaction.isButton() && interaction.customId === 'bg:start')) {
       { label: 'No major history/MR restrictions', value: 'history' }
     );
 
-  // start with ONLY the menu (no Pass/Decline yet)
   await interaction.reply({
     ephemeral: true,
     content: '**Background check (locked to you)**\nSelect all that **PASS**. Buttons will appear once you make a selection.\n_This lock auto-expires after 5 minutes of inactivity._',
@@ -434,10 +427,10 @@ if (interaction.isButton() && interaction.customId === 'bg:start')) {
   return;
 }
 
+// Selection updates
 if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu:')) {
   const originMessageId = interaction.customId.split(':')[2];
 
-  // only lock holder may change selections
   const lock = getBgLock(originMessageId);
   if (!lock || lock.userId !== interaction.user.id) {
     return interaction.reply({
@@ -447,16 +440,12 @@ if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu
         : '⚠️ This session is no longer active. Start it again from the message.',
     });
   }
-
-  // refresh lock timestamp on activity
-  setBgLock(originMessageId, interaction.user.id);
+  setBgLock(originMessageId, interaction.user.id); // refresh lock
 
   saveBgSelection(originMessageId, interaction.values);
 
   const count = interaction.values.length;
-  const menuRow = interaction.message.components[0]; // keep the same menu row
-
-  // replace/append actions row depending on selection count
+  const menuRow = interaction.message.components[0];
   const rows = [menuRow, buildBgActionsRow(originMessageId, count)];
 
   await interaction.update({
@@ -469,7 +458,7 @@ if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu
   return;
 }
 
-// Cancel (precise unlock)
+// Cancel (unlock)
 if (interaction.isButton() && interaction.customId.startsWith('bg:cancel:')) {
   const originMessageId = interaction.customId.split(':')[2];
   const lock = getBgLock(originMessageId);
@@ -478,13 +467,13 @@ if (interaction.isButton() && interaction.customId.startsWith('bg:cancel:')) {
   return;
 }
 
+// Pass / Decline
 if (
   interaction.isButton() &&
   (interaction.customId.startsWith('bg:pass:') || interaction.customId.startsWith('bg:decline:'))
 ) {
   const [, action, originMessageId] = interaction.customId.split(':');
 
-  // only lock holder may submit
   const lock = getBgLock(originMessageId);
   if (!lock || lock.userId !== interaction.user.id) {
     return interaction.reply({
@@ -499,7 +488,6 @@ if (
   const statusEmoji = action === 'pass' ? '✅' : '❌';
   setBgStatus(originMessageId, statusWord);
 
-  // update original message embed with header "Background Check: PASS/FAIL"
   const ch = interaction.channel;
   const msg = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
   if (!msg) {
@@ -528,13 +516,11 @@ if (
     await msg.edit({ embeds: [base], components: [disabledRow] });
   }
 
-  // release the lock on successful submit
   clearBgLock(originMessageId);
 
   await interaction.update({ content: `✅ Background check **${statusWord}** recorded.`, components: [] });
   return;
 }
-
 
 
 /* =========================
