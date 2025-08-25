@@ -494,8 +494,17 @@ if (interaction.isButton() && interaction.customId.startsWith('obs:start:')) {
     return interaction.reply({ ephemeral: true, embeds: [viewEmbed] });
   }
 
-  // show modal (NOT asking for date/observer anymore)
+  // show modal (now WITH a Date field prefilled to today)
   const modal = new ModalBuilder().setCustomId(`obs:modal:${originMessageId}:${idx}`).setTitle(`Observation ${idx}`);
+
+  const today = new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
+
+  const date = new TextInputBuilder()
+    .setCustomId('date')
+    .setLabel('Date')
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setValue(today); // prefill with today's date
 
   const notes = new TextInputBuilder()
     .setCustomId('notes')
@@ -512,6 +521,7 @@ if (interaction.isButton() && interaction.customId.startsWith('obs:start:')) {
 
   await interaction.showModal(
     modal.addComponents(
+      new ActionRowBuilder().addComponents(date),
       new ActionRowBuilder().addComponents(notes),
       new ActionRowBuilder().addComponents(issues)
     )
@@ -561,14 +571,15 @@ if (interaction.isButton() && interaction.customId.startsWith('obs:view:')) {
 if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')) {
   const [, , originMessageId, idx] = interaction.customId.split(':');
 
+  // read date as submitted (fallback to today if somehow empty)
+  const dateInput = (interaction.fields.getTextInputValue('date') || '').trim();
+  const date = dateInput || new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
+
   const notes = interaction.fields.getTextInputValue('notes').trim().slice(0, 1024);
   const issues = (interaction.fields.getTextInputValue('issues') || '').trim().slice(0, 1024);
 
-  // auto-fill today's date (MM/DD/YYYY)
-  const date = new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
-
   saveObservation(originMessageId, idx, {
-    username: null,           // no longer used (Observer is byUserId mention)
+    username: null, // not used; observer tracked via byUserId
     date,
     notes,
     issues,
@@ -578,38 +589,36 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')
   // refresh all copies (original + any polls)
   await editAllObsMessagesFromDb(client, originMessageId);
 
- // Mirror to polls when all three recorded
-if (haveAllThree(originMessageId) && RECRUITMENT_POLLS_CHANNEL_ID) {
-  try {
-    const refs = getMsgRefs(originMessageId);
-    const originRef = refs.find((r) => r.messageId === originMessageId) || refs[0];
-    const ch = originRef ? await client.channels.fetch(originRef.channelId).catch(() => null) : null;
-    const orig = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
-    const baseEmbed = orig?.embeds?.[0] ? EmbedBuilder.from(orig.embeds[0]) : null;
+  // Mirror to polls when all three recorded
+  if (haveAllThree(originMessageId) && RECRUITMENT_POLLS_CHANNEL_ID) {
+    try {
+      const refs = getMsgRefs(originMessageId);
+      const originRef = refs.find((r) => r.messageId === originMessageId) || refs[0];
+      const ch = originRef ? await client.channels.fetch(originRef.channelId).catch(() => null) : null;
+      const orig = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
+      const baseEmbed = orig?.embeds?.[0] ? EmbedBuilder.from(orig.embeds[0]) : null;
 
-    const pollsCh = await client.channels.fetch(RECRUITMENT_POLLS_CHANNEL_ID).catch(() => null);
-    if (pollsCh && baseEmbed) {
-      // 👇 clone original embed but force the title to "Promotion Poll"
-      const pollEmbed = EmbedBuilder.from(baseEmbed).setTitle("Promotion Poll");
+      const pollsCh = await client.channels.fetch(RECRUITMENT_POLLS_CHANNEL_ID).catch(() => null);
+      if (pollsCh && baseEmbed) {
+        const pollEmbed = EmbedBuilder.from(baseEmbed).setTitle('Promotion Poll');
+        const pollsMsg = await pollsCh
+          .send({
+            content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,
+            embeds: [pollEmbed],
+            components: [buildObsRowFromDb(originMessageId)],
+          })
+          .catch(() => null);
 
-      const pollsMsg = await pollsCh
-        .send({
-          content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,
-          embeds: [pollEmbed],
-          components: [buildObsRowFromDb(originMessageId)],
-        })
-        .catch(() => null);
-
-      if (pollsMsg) {
-        addMsgRef(originMessageId, pollsCh.id, pollsMsg.id);
-        await reactWith(pollsMsg, VOTE_YES_EMOJI || '✅');
-        await reactWith(pollsMsg, VOTE_NO_EMOJI || '❌');
+        if (pollsMsg) {
+          addMsgRef(originMessageId, pollsCh.id, pollsMsg.id);
+          await reactWith(pollsMsg, VOTE_YES_EMOJI || '✅');
+          await reactWith(pollsMsg, VOTE_NO_EMOJI || '❌');
+        }
       }
+    } catch (e) {
+      console.error('Polls mirror failed:', e);
     }
-  } catch (e) {
-    console.error('Polls mirror failed:', e);
   }
-}
 
   // Send a nice confirmation with the same stacked fields
   let lrUsername = '—';
@@ -640,6 +649,7 @@ if (haveAllThree(originMessageId) && RECRUITMENT_POLLS_CHANNEL_ID) {
   await interaction.reply({ ephemeral: true, embeds: [confirm] });
   return;
 }
+
 
   } catch (err) {
     console.error(err);
