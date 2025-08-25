@@ -547,7 +547,7 @@ if (interaction.isButton() && interaction.customId.startsWith('obs:start:')) {
         const lrField = emb?.fields?.find(f => (f.name || '').toLowerCase() === 'lr username');
         if (lrField?.value) lrUsername = lrField.value;
       }
-    } catch (_) {}
+    } catch { /* noop */ }
 
     const todayFallback = new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
 
@@ -559,15 +559,14 @@ if (interaction.isButton() && interaction.customId.startsWith('obs:start:')) {
         { name: 'Date', value: row.date || todayFallback, inline: false },
         { name: 'Observation Notes', value: row.notes || '—', inline: false },
         { name: 'Observation Issues', value: row.issues || 'None', inline: false },
-        { name: 'Recommended Individual', value: lrUsername, inline: false }
+        { name: 'Recommended Individual', value: lrUsername, inline: false },
       )
       .setTimestamp();
     return interaction.reply({ ephemeral: true, embeds: [viewEmbed] });
   }
 
-  // show modal (now WITH a Date field prefilled to today)
+  // show modal (WITH a Date field prefilled to today)
   const modal = new ModalBuilder().setCustomId(`obs:modal:${originMessageId}:${idx}`).setTitle(`Observation ${idx}`);
-
   const today = new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
 
   const date = new TextInputBuilder()
@@ -575,7 +574,7 @@ if (interaction.isButton() && interaction.customId.startsWith('obs:start:')) {
     .setLabel('Date')
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
-    .setValue(today); // prefill with today's date
+    .setValue(today);
 
   const notes = new TextInputBuilder()
     .setCustomId('notes')
@@ -594,7 +593,7 @@ if (interaction.isButton() && interaction.customId.startsWith('obs:start:')) {
     modal.addComponents(
       new ActionRowBuilder().addComponents(date),
       new ActionRowBuilder().addComponents(notes),
-      new ActionRowBuilder().addComponents(issues)
+      new ActionRowBuilder().addComponents(issues),
     )
   );
   return;
@@ -618,7 +617,7 @@ if (interaction.isButton() && interaction.customId.startsWith('obs:view:')) {
       const lrField = emb?.fields?.find(f => (f.name || '').toLowerCase() === 'lr username');
       if (lrField?.value) lrUsername = lrField.value;
     }
-  } catch (_) {}
+  } catch { /* noop */ }
 
   const todayFallback = new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
 
@@ -630,7 +629,7 @@ if (interaction.isButton() && interaction.customId.startsWith('obs:view:')) {
       { name: 'Date', value: row.date || todayFallback, inline: false },
       { name: 'Observation Notes', value: row.notes || '—', inline: false },
       { name: 'Observation Issues', value: row.issues || 'None', inline: false },
-      { name: 'Recommended Individual', value: lrUsername, inline: false }
+      { name: 'Recommended Individual', value: lrUsername, inline: false },
     )
     .setTimestamp();
 
@@ -638,24 +637,42 @@ if (interaction.isButton() && interaction.customId.startsWith('obs:view:')) {
   return;
 }
 
-// Modal submit (store; update buttons; mirror if all three done)
+// Modal submit (FIRST-WINS; mirror if all three done)
 if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')) {
   const [, , originMessageId, idx] = interaction.customId.split(':');
 
-  // read date as submitted (fallback to today if somehow empty)
+  // ⛔ first-wins guard BEFORE saving
+  const existing = getObservation(originMessageId, idx);
+  if (existing) {
+    return interaction.reply({
+      ephemeral: true,
+      content: `⚠️ Observation **${idx}** was already submitted by <@${existing.byUserId || 'unknown'}>. Your submission wasn’t saved.`,
+    });
+  }
+
+  // read date (fallback to today)
   const dateInput = (interaction.fields.getTextInputValue('date') || '').trim();
   const date = dateInput || new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
-
-  const notes = interaction.fields.getTextInputValue('notes').trim().slice(0, 1024);
+  const notes = (interaction.fields.getTextInputValue('notes') || '').trim().slice(0, 1024);
   const issues = (interaction.fields.getTextInputValue('issues') || '').trim().slice(0, 1024);
 
+  // save attempt
   saveObservation(originMessageId, idx, {
-    username: null, // not used; observer tracked via byUserId
+    username: null,
     date,
     notes,
     issues,
     byUserId: interaction.user.id,
   });
+
+  // race-check AFTER saving (if two hit submit at the same time)
+  const now = getObservation(originMessageId, idx);
+  if (!now || now.byUserId !== interaction.user.id) {
+    return interaction.reply({
+      ephemeral: true,
+      content: `⚠️ Someone submitted Observation **${idx}** just before you. Yours wasn’t saved.`,
+    });
+  }
 
   // refresh all copies (original + any polls)
   await editAllObsMessagesFromDb(client, originMessageId);
@@ -664,26 +681,24 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')
   if (haveAllThree(originMessageId) && RECRUITMENT_POLLS_CHANNEL_ID) {
     try {
       const refs = getMsgRefs(originMessageId);
-      const originRef = refs.find((r) => r.messageId === originMessageId) || refs[0];
-      const ch = originRef ? await client.channels.fetch(originRef.channelId).catch(() => null) : null;
+      const originRef = refs.find(r => r.messageId === originMessageId) || refs[0];
+      const ch   = originRef ? await client.channels.fetch(originRef.channelId).catch(() => null) : null;
       const orig = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
-      const baseEmbed = orig?.embeds?.[0] ? EmbedBuilder.from(orig.embeds[0]) : null;
+      const base = orig?.embeds?.[0] ? EmbedBuilder.from(orig.embeds[0]) : null;
 
       const pollsCh = await client.channels.fetch(RECRUITMENT_POLLS_CHANNEL_ID).catch(() => null);
-      if (pollsCh && baseEmbed) {
-        const pollEmbed = EmbedBuilder.from(baseEmbed).setTitle('Promotion Poll');
-        const pollsMsg = await pollsCh
-          .send({
-            content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,
-            embeds: [pollEmbed],
-            components: [buildObsRowFromDb(originMessageId)],
-          })
-          .catch(() => null);
+      if (pollsCh && base) {
+        const pollEmbed = EmbedBuilder.from(base).setTitle('Promotion Poll');
+        const pollsMsg = await pollsCh.send({
+          content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,
+          embeds: [pollEmbed],
+          components: [buildObsRowFromDb(originMessageId)],
+        }).catch(() => null);
 
         if (pollsMsg) {
           addMsgRef(originMessageId, pollsCh.id, pollsMsg.id);
           await reactWith(pollsMsg, VOTE_YES_EMOJI || '✅');
-          await reactWith(pollsMsg, VOTE_NO_EMOJI || '❌');
+          await reactWith(pollsMsg, VOTE_NO_EMOJI  || '❌');
         }
       }
     } catch (e) {
@@ -691,7 +706,7 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')
     }
   }
 
-  // Send a nice confirmation with the same stacked fields
+  // confirmation embed
   let lrUsername = '—';
   try {
     const refs = getMsgRefs(originMessageId);
@@ -703,7 +718,7 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')
       const lrField = emb?.fields?.find(f => (f.name || '').toLowerCase() === 'lr username');
       if (lrField?.value) lrUsername = lrField.value;
     }
-  } catch (_) {}
+  } catch { /* noop */ }
 
   const confirm = new EmbedBuilder()
     .setTitle(`Observation ${idx} Recorded`)
@@ -713,14 +728,13 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')
       { name: 'Date', value: date, inline: false },
       { name: 'Observation Notes', value: notes || '—', inline: false },
       { name: 'Observation Issues', value: issues || 'None', inline: false },
-      { name: 'Recommended Individual', value: lrUsername, inline: false }
+      { name: 'Recommended Individual', value: lrUsername, inline: false },
     )
     .setTimestamp();
 
   await interaction.reply({ ephemeral: true, embeds: [confirm] });
   return;
 }
-
 
   } catch (err) {
     console.error(err);
