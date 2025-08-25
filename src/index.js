@@ -352,93 +352,106 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    /* =========================
-       BACKGROUND CHECK (DB-backed)
-       ========================= */
-    if (interaction.isButton() && interaction.customId === 'bg:start') {
-      // The message being clicked IS the origin
-      const originMessageId = interaction.message.id;
+   /* =========================
+   BACKGROUND CHECK (DB-backed)
+   ========================= */
+if (interaction.isButton() && interaction.customId === 'bg:start') {
+  // The message being clicked IS the origin
+  const originMessageId = interaction.message.id;
 
-      const menu = new StringSelectMenuBuilder()
-        .setCustomId(`bg:menu:${originMessageId}`)
-        .setPlaceholder('Select all items that PASS')
-        .setMinValues(0)
-        .setMaxValues(5)
-        .addOptions(
-          { label: '60+ day account age', value: 'age' },
-          { label: 'No Safechat', value: 'safechat' },
-          { label: 'Seen 2+ days by recommender', value: 'seen' },
-          { label: 'In communications server', value: 'comms' },
-          { label: 'No major history/MR restrictions', value: 'history' }
-        );
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`bg:menu:${originMessageId}`)
+    .setPlaceholder('Select all items that PASS')
+    .setMinValues(0)
+    .setMaxValues(5)
+    .addOptions(
+      { label: '60+ day account age', value: 'age' },
+      { label: 'No Safechat', value: 'safechat' },
+      { label: 'Seen 2+ days by recommender', value: 'seen' },
+      { label: 'In communications server', value: 'comms' },
+      { label: 'No major history/MR restrictions', value: 'history' }
+    );
 
-      const actions = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`bg:pass:${originMessageId}`).setLabel('Pass').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`bg:decline:${originMessageId}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId(`bg:cancel`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
-      );
+  const actions = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`bg:pass:${originMessageId}`).setLabel('Pass').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`bg:decline:${originMessageId}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`bg:cancel`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+  );
 
-      await interaction.reply({
-        ephemeral: true,
-        content:
-          '**Background check**\nSelect all that **PASS**, then choose **Pass** or **Decline**.',
-        components: [new ActionRowBuilder().addComponents(menu), actions],
-      });
-      return;
-    }
+  await interaction.reply({
+    ephemeral: true,
+    content: '**Background check**\nSelect all that **PASS**, then choose **Pass** or **Decline**.',
+    components: [new ActionRowBuilder().addComponents(menu), actions],
+  });
+  return;
+}
 
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu:')) {
-      const originMessageId = interaction.customId.split(':')[2];
-      saveBgSelection(originMessageId, interaction.values);
+if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu:')) {
+  const originMessageId = interaction.customId.split(':')[2];
+  saveBgSelection(originMessageId, interaction.values);
 
-      await interaction.update({
-        content: `Selections saved (${interaction.values.length}/5). Choose **Pass** or **Decline** when ready.`,
-        components: interaction.message.components,
-      });
-      return;
-    }
+  await interaction.update({
+    content: `Selections saved (${interaction.values.length}/5). Choose **Pass** or **Decline** when ready.`,
+    components: interaction.message.components,
+  });
+  return;
+}
 
-    if (interaction.isButton() && interaction.customId === 'bg:cancel') {
-      await interaction.update({ content: '❎ Background check cancelled.', components: [] });
-      return;
-    }
+if (interaction.isButton() && interaction.customId === 'bg:cancel') {
+  await interaction.update({ content: '❎ Background check cancelled.', components: [] });
+  return;
+}
 
-    if (interaction.isButton() && (interaction.customId.startsWith('bg:pass:') || interaction.customId.startsWith('bg:decline:'))) {
-      const [, action, originMessageId] = interaction.customId.split(':');
-      const status = action === 'pass' ? 'PASS' : 'FAILED';
-      setBgStatus(originMessageId, status);
+if (
+  interaction.isButton() &&
+  (interaction.customId.startsWith('bg:pass:') || interaction.customId.startsWith('bg:decline:'))
+) {
+  const [, action, originMessageId] = interaction.customId.split(':');
 
-      // update original embed field
-      const ch = interaction.channel;
-      const msg = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
-      if (!msg) {
-        await interaction.update({ content: '❌ Could not update the original message.', components: [] });
-        return;
-      }
+  // Use PASS / FAIL for consistency with header text
+  const statusWord = action === 'pass' ? 'PASS' : 'FAIL';
+  const statusEmoji = action === 'pass' ? '✅' : '❌';
+  setBgStatus(originMessageId, statusWord);
 
-      const bg = getBg(originMessageId);
-      const selected = JSON.parse(bg.selected_json || '[]');
-      const lines = buildChecklistLinesFromSelected(selected);
+  // update original embed field
+  const ch = interaction.channel;
+  const msg = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
+  if (!msg) {
+    await interaction.update({ content: '❌ Could not update the original message.', components: [] });
+    return;
+  }
 
-      const baseEmbed = msg.embeds?.[0] ? EmbedBuilder.from(msg.embeds[0]) : new EmbedBuilder();
-      const existing = baseEmbed.data.fields ?? [];
-      const nextFields = existing.filter((f) => (f.name || '').toLowerCase() !== 'background check');
-      const value = `${status === 'PASS' ? '✅' : '❌'} **Background check:** ${status}\n${lines.join('\n')}`;
-      nextFields.push({ name: 'Background check', value, inline: false });
-      baseEmbed.setFields(nextFields);
+  const bg = getBg(originMessageId);
+  const selected = JSON.parse(bg.selected_json || '[]');
+  const lines = buildChecklistLinesFromSelected(selected); // array of "✅ 60+ day..." etc.
 
-      if (status === 'PASS') {
-        await msg.edit({ embeds: [baseEmbed], components: [buildObsRowFromDb(originMessageId)] });
-      } else {
-        const disabledRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('bg:disabled').setLabel('Background check').setStyle(ButtonStyle.Secondary).setDisabled(true)
-        );
-        await msg.edit({ embeds: [baseEmbed], components: [disabledRow] });
-      }
+  const baseEmbed = msg.embeds?.[0] ? EmbedBuilder.from(msg.embeds[0]) : new EmbedBuilder();
+  const existing = baseEmbed.data.fields ?? [];
 
-      await interaction.update({ content: `✅ Background check **${status}** recorded.`, components: [] });
-      return;
-    }
+  // remove any prior background-check field (title may vary)
+  const nextFields = existing.filter(
+    (f) => !((f.name || '').toLowerCase().startsWith('background check') || (f.name || '').toLowerCase().includes('background check'))
+  );
+
+  // put PASS/FAIL in the field header; body is just the checklist
+  const name = `${statusEmoji} Background Check: ${statusWord}`;
+  const value = lines.join('\n');
+
+  nextFields.push({ name, value, inline: false });
+  baseEmbed.setFields(nextFields);
+
+  if (action === 'pass') {
+    await msg.edit({ embeds: [baseEmbed], components: [buildObsRowFromDb(originMessageId)] });
+  } else {
+    const disabledRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('bg:disabled').setLabel('Background check').setStyle(ButtonStyle.Secondary).setDisabled(true)
+    );
+    await msg.edit({ embeds: [baseEmbed], components: [disabledRow] });
+  }
+
+  await interaction.update({ content: `✅ Background check **${statusWord}** recorded.`, components: [] });
+  return;
+}
 
 /* =========================
    OBSERVATIONS (3 slots, DB-backed)
@@ -565,36 +578,38 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')
   // refresh all copies (original + any polls)
   await editAllObsMessagesFromDb(client, originMessageId);
 
-  // Mirror to polls when all three recorded
-  if (haveAllThree(originMessageId) && RECRUITMENT_POLLS_CHANNEL_ID) {
-    try {
-      // fetch the original to reuse its embed
-      const refs = getMsgRefs(originMessageId);
-      const originRef = refs.find((r) => r.messageId === originMessageId) || refs[0];
-      const ch = originRef ? await client.channels.fetch(originRef.channelId).catch(() => null) : null;
-      const orig = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
-      const baseEmbed = orig?.embeds?.[0] ? EmbedBuilder.from(orig.embeds[0]) : null;
+ // Mirror to polls when all three recorded
+if (haveAllThree(originMessageId) && RECRUITMENT_POLLS_CHANNEL_ID) {
+  try {
+    const refs = getMsgRefs(originMessageId);
+    const originRef = refs.find((r) => r.messageId === originMessageId) || refs[0];
+    const ch = originRef ? await client.channels.fetch(originRef.channelId).catch(() => null) : null;
+    const orig = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
+    const baseEmbed = orig?.embeds?.[0] ? EmbedBuilder.from(orig.embeds[0]) : null;
 
-      const pollsCh = await client.channels.fetch(RECRUITMENT_POLLS_CHANNEL_ID).catch(() => null);
-      if (pollsCh && baseEmbed) {
-        const pollsMsg = await pollsCh
-          .send({
-            content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,
-            embeds: [baseEmbed],
-            components: [buildObsRowFromDb(originMessageId)],
-          })
-          .catch(() => null);
+    const pollsCh = await client.channels.fetch(RECRUITMENT_POLLS_CHANNEL_ID).catch(() => null);
+    if (pollsCh && baseEmbed) {
+      // 👇 clone original embed but force the title to "Promotion Poll"
+      const pollEmbed = EmbedBuilder.from(baseEmbed).setTitle("Promotion Poll");
 
-        if (pollsMsg) {
-          addMsgRef(originMessageId, pollsCh.id, pollsMsg.id);
-          await reactWith(pollsMsg, VOTE_YES_EMOJI || '✅');
-          await reactWith(pollsMsg, VOTE_NO_EMOJI || '❌');
-        }
+      const pollsMsg = await pollsCh
+        .send({
+          content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,
+          embeds: [pollEmbed],
+          components: [buildObsRowFromDb(originMessageId)],
+        })
+        .catch(() => null);
+
+      if (pollsMsg) {
+        addMsgRef(originMessageId, pollsCh.id, pollsMsg.id);
+        await reactWith(pollsMsg, VOTE_YES_EMOJI || '✅');
+        await reactWith(pollsMsg, VOTE_NO_EMOJI || '❌');
       }
-    } catch (e) {
-      console.error('Polls mirror failed:', e);
     }
+  } catch (e) {
+    console.error('Polls mirror failed:', e);
   }
+}
 
   // Send a nice confirmation with the same stacked fields
   let lrUsername = '—';
