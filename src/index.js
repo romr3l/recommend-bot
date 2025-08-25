@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import Database from 'better-sqlite3';
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -23,130 +24,200 @@ const {
   RECRUITMENT_POLLS_CHANNEL_ID,
   VOTE_YES_EMOJI,
   VOTE_NO_EMOJI,
-  PING_ROLE_ID, 
+  PING_ROLE_ID,
+  DB_PATH, // e.g. /data/recruitment.db on Railway
 } = process.env;
 
 if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN');
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
-// ---------- State ----------
+/* =========================
+   PERSISTENT STORAGE (SQLite)
+   ========================= */
+const db = new Database(DB_PATH || './recruitment.db');
+db.pragma('journal_mode = wal');
 
-// Slash -> modal stash
-// key = token; value = { fileName, url, userId, createdAt }
+db.exec(`
+CREATE TABLE IF NOT EXISTS bg_checks (
+  messageId TEXT PRIMARY KEY,
+  status TEXT,                -- 'PASS' | 'FAILED' | NULL
+  selected_json TEXT,         -- '["age","safechat",...]'
+  updatedAt INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS observations (
+  messageId TEXT NOT NULL,
+  idx INTEGER NOT NULL,       -- 1 | 2 | 3
+  username TEXT,
+  date TEXT,
+  notes TEXT,
+  issues TEXT,
+  byUserId TEXT,
+  createdAt INTEGER,
+  PRIMARY KEY (messageId, idx)
+);
+
+-- store all messages we must keep in sync (original + polls)
+CREATE TABLE IF NOT EXISTS message_refs (
+  originMessageId TEXT NOT NULL,   -- the original recommendation messageId
+  channelId TEXT NOT NULL,
+  messageId TEXT NOT NULL,
+  PRIMARY KEY (originMessageId, messageId)
+);
+`);
+
+function addMsgRef(originMessageId, channelId, messageId) {
+  db.prepare(
+    `INSERT OR IGNORE INTO message_refs (originMessageId, channelId, messageId) VALUES (?,?,?)`
+  ).run(originMessageId, channelId, messageId);
+}
+function getMsgRefs(originMessageId) {
+  return db
+    .prepare(`SELECT channelId, messageId FROM message_refs WHERE originMessageId=?`)
+    .all(originMessageId);
+}
+
+function saveBgSelection(messageId, values) {
+  db.prepare(
+    `
+    INSERT INTO bg_checks (messageId, status, selected_json, updatedAt)
+    VALUES (?, NULL, ?, ?)
+    ON CONFLICT(messageId) DO UPDATE SET selected_json=excluded.selected_json, updatedAt=excluded.updatedAt
+  `
+  ).run(messageId, JSON.stringify(values || []), Date.now());
+}
+function setBgStatus(messageId, status) {
+  db.prepare(
+    `
+    INSERT INTO bg_checks (messageId, status, selected_json, updatedAt)
+    VALUES (?, ?, COALESCE((SELECT selected_json FROM bg_checks WHERE messageId=?), '[]'), ?)
+    ON CONFLICT(messageId) DO UPDATE SET status=excluded.status, updatedAt=excluded.updatedAt
+  `
+  ).run(messageId, status, messageId, Date.now());
+}
+function getBg(messageId) {
+  return db
+    .prepare(`SELECT status, selected_json FROM bg_checks WHERE messageId=?`)
+    .get(messageId) || {};
+}
+
+function saveObservation(messageId, idx, data) {
+  db.prepare(
+    `
+    INSERT INTO observations (messageId, idx, username, date, notes, issues, byUserId, createdAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(messageId, idx) DO UPDATE SET
+      username=excluded.username,
+      date=excluded.date,
+      notes=excluded.notes,
+      issues=excluded.issues,
+      byUserId=excluded.byUserId
+  `
+  ).run(
+    messageId,
+    Number(idx),
+    data.username,
+    data.date,
+    data.notes,
+    data.issues,
+    data.byUserId,
+    Date.now()
+  );
+}
+function getObservation(messageId, idx) {
+  return db
+    .prepare(`SELECT * FROM observations WHERE messageId=? AND idx=?`)
+    .get(messageId, Number(idx));
+}
+function getDoneSet(messageId) {
+  const rows = db.prepare(`SELECT idx FROM observations WHERE messageId=?`).all(messageId);
+  return new Set(rows.map((r) => String(r.idx)));
+}
+function haveAllThree(messageId) {
+  const row = db.prepare(`SELECT COUNT(*) AS c FROM observations WHERE messageId=?`).get(messageId);
+  return (row?.c || 0) >= 3;
+}
+
+/* =========================
+   EPHEMERAL STASH (upload)
+   ========================= */
+// Slash -> modal stash (just for the 1-step handoff)
 const pendingProof = new Map();
 
-// Background-check sessions
-// key = token; value = { msgId, channelId, guildId, lrUsername, selected:Set<string> }
-const bgSessions = new Map();
-
-// Observation sessions
-// key = obsToken; value = {
-//   msgRefs: [{ channelId, msgId }], // original + polls copy
-//   channelId, guildId, lrUsername,
-//   done: Set<'1'|'2'>,
-//   data: { '1'?: {username,date,notes,issues}, '2'?: {...} }
-// }
-const obsSessions = new Map();
-
-// ---------- Helpers ----------
-
-function buildChecklistLines(selectedSet) {
+/* =========================
+   HELPERS
+   ========================= */
+function buildChecklistLinesFromSelected(selected) {
   const items = [
-    { key: 'age',     label: '60+ day account age' },
-    { key: 'safechat',label: 'No Safechat' },
-    { key: 'seen',    label: 'Seen 2+ days by recommender' },
-    { key: 'comms',   label: 'In communications server' },
+    { key: 'age', label: '60+ day account age' },
+    { key: 'safechat', label: 'No Safechat' },
+    { key: 'seen', label: 'Seen 2+ days by recommender' },
+    { key: 'comms', label: 'In communications server' },
     { key: 'history', label: 'No major history/MR restrictions' },
   ];
-  const selected = selectedSet ?? new Set();
-  return {
-    items,
-    lines: items.map(i => `${selected.has(i.key) ? '✅' : '❌'} ${i.label}`),
-    allPass: items.every(i => selected.has(i.key)),
+  const s = new Set(selected || []);
+  return items.map((i) => `${s.has(i.key) ? '✅' : '❌'} ${i.label}`);
+}
+
+function buildObsRowFromDb(originMessageId) {
+  const done = getDoneSet(originMessageId);
+
+  const mk = (idx) => {
+    const i = String(idx);
+    if (done.has(i)) {
+      return new ButtonBuilder()
+        .setCustomId(`obs:view:${originMessageId}:${i}`)
+        .setLabel(`View Observation ${i}`)
+        .setStyle(ButtonStyle.Primary);
+    }
+    return new ButtonBuilder()
+      .setCustomId(`obs:start:${originMessageId}:${i}`)
+      .setLabel(`Observation ${i}`)
+      .setStyle(ButtonStyle.Secondary);
   };
+
+  return new ActionRowBuilder().addComponents(mk(1), mk(2), mk(3));
 }
 
-// Edit the original message's embed and upsert the Background Check field
-async function writeBgResultToMessage(client, ctx, statusEmoji, statusWord, lines) {
-  const ch = await client.channels.fetch(ctx.channelId).catch(() => null);
-  const msg = ch ? await ch.messages.fetch(ctx.msgId).catch(() => null) : null;
-  if (!msg) throw new Error('Original message not found');
-
-  const baseEmbed = msg.embeds?.[0] ? EmbedBuilder.from(msg.embeds[0]) : new EmbedBuilder();
-  const existing = baseEmbed.data.fields ?? [];
-
-  const nextFields = existing.filter(f => (f.name || '').toLowerCase() !== 'background check');
-  const value = `${statusEmoji} **Background check:** ${statusWord}\n${lines.join('\n')}`;
-  nextFields.push({ name: 'Background check', value, inline: false });
-  baseEmbed.setFields(nextFields);
-
-  await msg.edit({ embeds: [baseEmbed] });
-  return msg;
-}
-
-// Build the row of observation buttons
-function buildObsRow(obsToken, ctx) {
-  const o1 = ctx.done.has('1');
-  const o2 = ctx.done.has('2');
-  const o3 = ctx.done.has('3');
-
-  const b1 = o1
-    ? new ButtonBuilder().setCustomId(`obs:view:${obsToken}:1`).setLabel('View Observation 1').setStyle(ButtonStyle.Primary)
-    : new ButtonBuilder().setCustomId(`obs:start:${obsToken}:1`).setLabel('Observation 1').setStyle(ButtonStyle.Secondary);
-
-  const b2 = o2
-    ? new ButtonBuilder().setCustomId(`obs:view:${obsToken}:2`).setLabel('View Observation 2').setStyle(ButtonStyle.Primary)
-    : new ButtonBuilder().setCustomId(`obs:start:${obsToken}:2`).setLabel('Observation 2').setStyle(ButtonStyle.Secondary);
-
-  const b3 = o3
-    ? new ButtonBuilder().setCustomId(`obs:view:${obsToken}:3`).setLabel('View Observation 3').setStyle(ButtonStyle.Primary)
-    : new ButtonBuilder().setCustomId(`obs:start:${obsToken}:3`).setLabel('Observation 3').setStyle(ButtonStyle.Secondary);
-
-  return new ActionRowBuilder().addComponents(b1, b2, b3);
-}
-
-
-// Edit all copies (original + polls) of the recommendation message
-async function editAllObsMessages(client, ctx, { components, embed }) {
-  const refs = ctx.msgRefs || [];
-  await Promise.all(refs.map(async ({ channelId, msgId }) => {
-    const ch = await client.channels.fetch(channelId).catch(() => null);
-    if (!ch) return;
-    const m = await ch.messages.fetch(msgId).catch(() => null);
-    if (!m) return;
-    const payload = {};
-    if (components) payload.components = components;
-    if (embed) payload.embeds = [embed];
-    await m.edit(payload).catch(() => {});
-  }));
+async function editAllObsMessagesFromDb(client, originMessageId) {
+  const components = [buildObsRowFromDb(originMessageId)];
+  const refs = getMsgRefs(originMessageId);
+  await Promise.all(
+    refs.map(async ({ channelId, messageId }) => {
+      const ch = await client.channels.fetch(channelId).catch(() => null);
+      if (!ch) return;
+      const m = await ch.messages.fetch(messageId).catch(() => null);
+      if (!m) return;
+      await m.edit({ components }).catch(() => {});
+    })
+  );
 }
 
 async function reactWith(message, emoji) {
   if (!emoji) return;
-  try { await message.react(emoji); } catch {}
+  try {
+    await message.react(emoji);
+  } catch {}
 }
 
-// ---------- Bot ----------
-
+/* =========================
+   BOT
+   ========================= */
 client.once('ready', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
 });
 
 client.on('interactionCreate', async (interaction) => {
   try {
-    // /recommend
+    /* ------- /recommend ------- */
     if (interaction.isChatInputCommand() && interaction.commandName === 'recommend') {
       if (ALLOWED_ROLE_IDS) {
-        const allowed = new Set(ALLOWED_ROLE_IDS.split(',').map(s => s.trim()));
+        const allowed = new Set(ALLOWED_ROLE_IDS.split(',').map((s) => s.trim()));
         const member = await interaction.guild.members.fetch(interaction.user.id);
-        if (!member.roles.cache.some(r => allowed.has(r.id))) {
+        if (!member.roles.cache.some((r) => allowed.has(r.id))) {
           return interaction.reply({ ephemeral: true, content: 'You do not have permission to use this command.' });
         }
       }
@@ -178,13 +249,10 @@ client.on('interactionCreate', async (interaction) => {
         '- They must be a member in our **communications server**, please type in their user in a chat they are in to see if their user pops up.',
         '- They must not have any **major history/MR restrictions** with Flawn Salon, the Recruitment Members will be able to check for you before you recommend any. You can DM them, as it is not recommended to ping them anywhere in the MR chat.',
         '',
-        'If you have any concerns in regards of recommendations, please feel free to DM a member of the Recruitment Department. Have fun recommending!'
+        'If you have any concerns in regards of recommendations, please feel free to DM a member of the Recruitment Department. Have fun recommending!',
       ].join('\n');
 
-      const embed = new EmbedBuilder()
-        .setTitle('Recommendation Requirements')
-        .setDescription(req)
-        .setColor(0x5865F2);
+      const embed = new EmbedBuilder().setTitle('Recommendation Requirements').setDescription(req).setColor(0x5865f2);
 
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`recommend:continue:${token}`).setLabel('Continue').setStyle(ButtonStyle.Primary),
@@ -195,7 +263,7 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // continue -> modal
+    /* ------- continue -> modal ------- */
     if (interaction.isButton() && interaction.customId.startsWith('recommend:continue:')) {
       const token = interaction.customId.split(':')[2];
       const stash = pendingProof.get(token);
@@ -203,30 +271,36 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ ephemeral: true, content: '❌ Session expired. Please run `/recommend` again.' });
       }
 
-      const modal = new ModalBuilder()
-        .setCustomId(`recommend_modal:${token}`)
-        .setTitle('Recommendation');
+      const modal = new ModalBuilder().setCustomId(`recommend_modal:${token}`).setTitle('Recommendation');
 
-      const lrInput = new TextInputBuilder().setCustomId('lr_username').setLabel('Roblox Username (LR)').setStyle(TextInputStyle.Short).setRequired(true);
-      const reasonInput = new TextInputBuilder().setCustomId('reason').setLabel('Why are you recommending this individual?').setStyle(TextInputStyle.Paragraph).setRequired(true);
+      const lrInput = new TextInputBuilder()
+        .setCustomId('lr_username')
+        .setLabel('Roblox Username (LR)')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+      const reasonInput = new TextInputBuilder()
+        .setCustomId('reason')
+        .setLabel('Why are you recommending this individual?')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true);
 
       await interaction.showModal(
         modal.addComponents(
           new ActionRowBuilder().addComponents(lrInput),
-          new ActionRowBuilder().addComponents(reasonInput),
+          new ActionRowBuilder().addComponents(reasonInput)
         )
       );
       return;
     }
 
-    // cancel
+    /* ------- cancel ------- */
     if (interaction.isButton() && interaction.customId.startsWith('recommend:cancel:')) {
       const token = interaction.customId.split(':')[2];
       pendingProof.delete(token);
       return interaction.update({ content: '❌ Recommendation cancelled.', embeds: [], components: [] });
     }
 
-    // modal submit -> post recommendation
+    /* ------- modal submit -> post recommendation ------- */
     if (interaction.isModalSubmit() && interaction.customId.startsWith('recommend_modal:')) {
       const token = interaction.customId.split(':')[1];
       const stash = pendingProof.get(token);
@@ -243,13 +317,10 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       const me = dest.guild.members.me ?? (await dest.guild.members.fetchMe());
-      const needed = new PermissionsBitField([
-        PermissionsBitField.Flags.SendMessages,
-        PermissionsBitField.Flags.EmbedLinks,
-      ]);
+      const needed = new PermissionsBitField([PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.EmbedLinks]);
       if (!me.permissionsIn(dest).has(needed)) {
         return interaction.reply({ ephemeral: true, content: '❌ I am missing permissions to post in the destination channel.' });
-      }
+        }
 
       const recEmbed = new EmbedBuilder()
         .setTitle('Recommendation')
@@ -257,46 +328,39 @@ client.on('interactionCreate', async (interaction) => {
         .addFields(
           { name: 'Recommender', value: `${interaction.user}`, inline: false },
           { name: 'LR Username', value: lrUsername, inline: true },
-          { name: 'Reason', value: reason || '—', inline: false },
+          { name: 'Reason', value: reason || '—', inline: false }
         )
         .setFooter({ text: `Submitted from: ${interaction.guild?.name ?? 'Unknown'}` })
         .setTimestamp()
         .setImage(stash.url);
 
-      const bgToken = crypto.randomUUID();
       const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`bg:start:${bgToken}`).setLabel('Background check').setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId(`bg:start`).setLabel('Background check').setStyle(ButtonStyle.Secondary)
       );
 
-    const sent = await dest.send({
-  content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,  // 👈 ping role here
-  embeds: [recEmbed],
-  components: [row],
-});
-
-
-      bgSessions.set(bgToken, {
-        msgId: sent.id,
-        channelId: sent.channelId,
-        guildId: sent.guildId,
-        lrUsername,
-        selected: new Set(),
+      const sent = await dest.send({
+        content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,
+        embeds: [recEmbed],
+        components: [row],
       });
+
+      // track original message as a ref so we can edit later
+      addMsgRef(sent.id, sent.channelId, sent.id);
 
       pendingProof.delete(token);
       await interaction.reply({ ephemeral: true, content: '✅ Recommendation sent to the Recruitment Department. Thanks!' });
       return;
     }
 
-    // ---------- Background Check ----------
-
-    if (interaction.isButton() && interaction.customId.startsWith('bg:start:')) {
-      const token = interaction.customId.split(':')[2];
-      const ctx = bgSessions.get(token);
-      if (!ctx) return interaction.reply({ ephemeral: true, content: '❌ This recommendation could not be found.' });
+    /* =========================
+       BACKGROUND CHECK (DB-backed)
+       ========================= */
+    if (interaction.isButton() && interaction.customId === 'bg:start') {
+      // The message being clicked IS the origin
+      const originMessageId = interaction.message.id;
 
       const menu = new StringSelectMenuBuilder()
-        .setCustomId(`bg:menu:${token}`)
+        .setCustomId(`bg:menu:${originMessageId}`)
         .setPlaceholder('Select all items that PASS')
         .setMinValues(0)
         .setMaxValues(5)
@@ -305,216 +369,223 @@ client.on('interactionCreate', async (interaction) => {
           { label: 'No Safechat', value: 'safechat' },
           { label: 'Seen 2+ days by recommender', value: 'seen' },
           { label: 'In communications server', value: 'comms' },
-          { label: 'No major history/MR restrictions', value: 'history' },
+          { label: 'No major history/MR restrictions', value: 'history' }
         );
 
-      const controls = new ActionRowBuilder().addComponents(menu);
       const actions = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`bg:pass:${token}`).setLabel('Pass').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`bg:decline:${token}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId(`bg:cancel:${token}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`bg:pass:${originMessageId}`).setLabel('Pass').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`bg:decline:${originMessageId}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`bg:cancel`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
       );
-
-      bgSessions.set(token, { ...ctx, selected: ctx.selected ?? new Set() });
 
       await interaction.reply({
         ephemeral: true,
-        content: `**Background check for:** \`${ctx.lrUsername}\`\nSelect all that **PASS**, then choose **Pass** or **Decline**.`,
-        components: [controls, actions]
+        content:
+          '**Background check**\nSelect all that **PASS**, then choose **Pass** or **Decline**.',
+        components: [new ActionRowBuilder().addComponents(menu), actions],
       });
       return;
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu:')) {
-      const token = interaction.customId.split(':')[2];
-      const ctx = bgSessions.get(token);
-      if (!ctx) return interaction.reply({ ephemeral: true, content: '❌ Session expired.' });
+      const originMessageId = interaction.customId.split(':')[2];
+      saveBgSelection(originMessageId, interaction.values);
 
-      ctx.selected = new Set(interaction.values);
-      bgSessions.set(token, ctx);
-
-      const { allPass } = buildChecklistLines(ctx.selected);
       await interaction.update({
-        content: `Selections saved (${ctx.selected.size}/5). ${allPass ? 'All checks currently passing.' : 'Some checks are not selected.'} Choose **Pass** or **Decline** when ready.`,
-        components: interaction.message.components
+        content: `Selections saved (${interaction.values.length}/5). Choose **Pass** or **Decline** when ready.`,
+        components: interaction.message.components,
       });
       return;
     }
 
-    if (interaction.isButton() && interaction.customId.startsWith('bg:cancel:')) {
-      const token = interaction.customId.split(':')[2];
-      bgSessions.delete(token);
+    if (interaction.isButton() && interaction.customId === 'bg:cancel') {
       await interaction.update({ content: '❎ Background check cancelled.', components: [] });
       return;
     }
 
-    if (interaction.isButton() &&
-        (interaction.customId.startsWith('bg:pass:') || interaction.customId.startsWith('bg:decline:'))) {
+    if (interaction.isButton() && (interaction.customId.startsWith('bg:pass:') || interaction.customId.startsWith('bg:decline:'))) {
+      const [, action, originMessageId] = interaction.customId.split(':');
+      const status = action === 'pass' ? 'PASS' : 'FAILED';
+      setBgStatus(originMessageId, status);
 
-      const [, action, token] = interaction.customId.split(':');
-      const ctx = bgSessions.get(token);
-      if (!ctx) return interaction.update({ content: '❌ Session expired.', components: [] });
-
-      const { lines } = buildChecklistLines(ctx.selected);
-      const statusWord  = action === 'pass' ? 'PASS' : 'FAILED';
-      const statusEmoji = action === 'pass' ? '✅'   : '❌';
-
-      try {
-        const msg = await writeBgResultToMessage(client, ctx, statusEmoji, statusWord, lines);
-
-        if (action === 'pass') {
-          // Start Observation session and show buttons
-          const obsToken = crypto.randomUUID();
-          const ctxForObs = {
-            msgRefs: [{ channelId: msg.channelId, msgId: msg.id }],
-            channelId: msg.channelId,
-            guildId: msg.guildId,
-            lrUsername: ctx.lrUsername,
-            done: new Set(),
-            data: {},
-          };
-          obsSessions.set(obsToken, ctxForObs);
-
-          await msg.edit({ components: [buildObsRow(obsToken, ctxForObs)] });
-        } else {
-          // Declined: disable the BG button
-          const disabledRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('bg:disabled').setLabel('Background check').setStyle(ButtonStyle.Secondary).setDisabled(true)
-          );
-          await msg.edit({ components: [disabledRow] });
-        }
-      } catch (e) {
-        console.error(e);
+      // update original embed field
+      const ch = interaction.channel;
+      const msg = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
+      if (!msg) {
         await interaction.update({ content: '❌ Could not update the original message.', components: [] });
-        bgSessions.delete(token);
         return;
       }
 
-      bgSessions.delete(token);
-      await interaction.update({ content: `✅ Background check **${statusWord}** recorded.`, components: [] });
+      const bg = getBg(originMessageId);
+      const selected = JSON.parse(bg.selected_json || '[]');
+      const lines = buildChecklistLinesFromSelected(selected);
+
+      const baseEmbed = msg.embeds?.[0] ? EmbedBuilder.from(msg.embeds[0]) : new EmbedBuilder();
+      const existing = baseEmbed.data.fields ?? [];
+      const nextFields = existing.filter((f) => (f.name || '').toLowerCase() !== 'background check');
+      const value = `${status === 'PASS' ? '✅' : '❌'} **Background check:** ${status}\n${lines.join('\n')}`;
+      nextFields.push({ name: 'Background check', value, inline: false });
+      baseEmbed.setFields(nextFields);
+
+      if (status === 'PASS') {
+        await msg.edit({ embeds: [baseEmbed], components: [buildObsRowFromDb(originMessageId)] });
+      } else {
+        const disabledRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('bg:disabled').setLabel('Background check').setStyle(ButtonStyle.Secondary).setDisabled(true)
+        );
+        await msg.edit({ embeds: [baseEmbed], components: [disabledRow] });
+      }
+
+      await interaction.update({ content: `✅ Background check **${status}** recorded.`, components: [] });
       return;
     }
 
-    // ---------- Observation Stage ----------
+    /* =========================
+       OBSERVATIONS (3 slots, DB-backed)
+       ========================= */
 
     // Start (or view if already done)
     if (interaction.isButton() && interaction.customId.startsWith('obs:start:')) {
-      const [, , obsToken, index] = interaction.customId.split(':');
-      const ctx = obsSessions.get(obsToken);
-      if (!ctx) return interaction.reply({ ephemeral: true, content: '❌ Observation session not found.' });
+      const [, , originMessageId, idx] = interaction.customId.split(':');
 
-      if (ctx.done.has(index)) {
-        const data = ctx.data?.[index];
+      // already done? show view
+      const row = getObservation(originMessageId, idx);
+      if (row) {
         const viewEmbed = new EmbedBuilder()
-          .setTitle(`Observation ${index}`)
+          .setTitle(`Observation ${idx}`)
           .setColor(0x43b581)
-          .setDescription([
-            `**Username:** ${data?.username ?? '—'}`,
-            `**Date:** ${data?.date ?? '—'}`,
-            `**Notes:** ${data?.notes ?? '—'}`,
-            `**Issues:** ${data?.issues || 'None'}`,
-          ].join('\n'))
-          .setFooter({ text: `For: ${ctx.lrUsername}` })
+          .setDescription(
+            [
+              `**Username:** ${row.username || '—'}`,
+              `**Date:** ${row.date || '—'}`,
+              `**Notes:** ${row.notes || '—'}`,
+              `**Issues:** ${row.issues || 'None'}`,
+              row.byUserId ? `**By:** <@${row.byUserId}>` : '',
+            ]
+              .filter(Boolean)
+              .join('\n')
+          )
           .setTimestamp();
         return interaction.reply({ ephemeral: true, embeds: [viewEmbed] });
       }
 
-      const modal = new ModalBuilder()
-        .setCustomId(`obs:modal:${obsToken}:${index}`)
-        .setTitle(`Observation ${index}`);
+      const modal = new ModalBuilder().setCustomId(`obs:modal:${originMessageId}:${idx}`).setTitle(`Observation ${idx}`);
 
       const u = new TextInputBuilder().setCustomId('username').setLabel('Username').setStyle(TextInputStyle.Short).setRequired(true);
-      const d = new TextInputBuilder().setCustomId('date').setLabel('Date').setStyle(TextInputStyle.Short).setRequired(true).setPlaceholder('e.g. 08/24/2025');
-      const notes = new TextInputBuilder().setCustomId('notes').setLabel('Observation Notes').setStyle(TextInputStyle.Paragraph).setRequired(true);
-      const issues = new TextInputBuilder().setCustomId('issues').setLabel('Observation Issues').setStyle(TextInputStyle.Paragraph).setRequired(false);
+      const d = new TextInputBuilder()
+        .setCustomId('date')
+        .setLabel('Date')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setPlaceholder('e.g. 08/24/2025');
+      const notes = new TextInputBuilder()
+        .setCustomId('notes')
+        .setLabel('Observation Notes')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true);
+      const issues = new TextInputBuilder()
+        .setCustomId('issues')
+        .setLabel('Observation Issues')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(false);
 
       await interaction.showModal(
         modal.addComponents(
           new ActionRowBuilder().addComponents(u),
           new ActionRowBuilder().addComponents(d),
           new ActionRowBuilder().addComponents(notes),
-          new ActionRowBuilder().addComponents(issues),
+          new ActionRowBuilder().addComponents(issues)
         )
       );
       return;
     }
 
-    // View (explicit)
+    // View
     if (interaction.isButton() && interaction.customId.startsWith('obs:view:')) {
-      const [, , obsToken, index] = interaction.customId.split(':');
-      const ctx = obsSessions.get(obsToken);
-      if (!ctx || !ctx.done.has(index)) {
-        return interaction.reply({ ephemeral: true, content: '❌ Observation not available yet.' });
-      }
-      const data = ctx.data?.[index];
+      const [, , originMessageId, idx] = interaction.customId.split(':');
+      const row = getObservation(originMessageId, idx);
+      if (!row) return interaction.reply({ ephemeral: true, content: '❌ Observation not available yet.' });
+
       const viewEmbed = new EmbedBuilder()
-        .setTitle(`Observation ${index}`)
+        .setTitle(`Observation ${idx}`)
         .setColor(0x43b581)
-        .setDescription([
-          `**Username:** ${data?.username ?? '—'}`,
-          `**Date:** ${data?.date ?? '—'}`,
-          `**Notes:** ${data?.notes ?? '—'}`,
-          `**Issues:** ${data?.issues || 'None'}`,
-        ].join('\n'))
-        .setFooter({ text: `For: ${ctx.lrUsername}` })
+        .setDescription(
+          [
+            `**Username:** ${row.username || '—'}`,
+            `**Date:** ${row.date || '—'}`,
+            `**Notes:** ${row.notes || '—'}`,
+            `**Issues:** ${row.issues || 'None'}`,
+            row.byUserId ? `**By:** <@${row.byUserId}>` : '',
+          ]
+            .filter(Boolean)
+            .join('\n')
+        )
         .setTimestamp();
 
       await interaction.reply({ ephemeral: true, embeds: [viewEmbed] });
       return;
     }
 
-    // Modal submit (store; update buttons; mirror if both done)
+    // Modal submit (store; update buttons; mirror if all three done)
     if (interaction.isModalSubmit() && interaction.customId.startsWith('obs:modal:')) {
-      const [, , obsToken, index] = interaction.customId.split(':');
-      const ctx = obsSessions.get(obsToken);
-      if (!ctx) return interaction.reply({ ephemeral: true, content: '❌ Observation session expired. Please try again.' });
+      const [, , originMessageId, idx] = interaction.customId.split(':');
 
       const username = interaction.fields.getTextInputValue('username').trim();
-      const date     = interaction.fields.getTextInputValue('date').trim();
-      const notes    = interaction.fields.getTextInputValue('notes').trim().slice(0, 1024);
-      const issues   = (interaction.fields.getTextInputValue('issues') || '').trim().slice(0, 1024);
+      const date = interaction.fields.getTextInputValue('date').trim();
+      const notes = interaction.fields.getTextInputValue('notes').trim().slice(0, 1024);
+      const issues = (interaction.fields.getTextInputValue('issues') || '').trim().slice(0, 1024);
 
-      ctx.done.add(index);
-      ctx.data = ctx.data || {};
-      ctx.data[index] = { username, date, notes, issues };
-      obsSessions.set(obsToken, ctx);
+      saveObservation(originMessageId, idx, {
+        username,
+        date,
+        notes,
+        issues,
+        byUserId: interaction.user.id,
+      });
 
-      const rows = [buildObsRow(obsToken, ctx)];
-      await editAllObsMessages(client, ctx, { components: rows });
+      // refresh all copies (original + any polls)
+      await editAllObsMessagesFromDb(client, originMessageId);
 
-      // Mirror to polls when both recorded
       // Mirror to polls when all three recorded
-if (ctx.done.has('1') && ctx.done.has('2') && ctx.done.has('3') && RECRUITMENT_POLLS_CHANNEL_ID) {
-        const firstRef = ctx.msgRefs[0];
-        const origCh = await client.channels.fetch(firstRef.channelId).catch(() => null);
-        const orig = origCh ? await origCh.messages.fetch(firstRef.msgId).catch(() => null) : null;
-        const baseEmbed = orig?.embeds?.[0] ? EmbedBuilder.from(orig.embeds[0]) : null;
+      if (haveAllThree(originMessageId) && RECRUITMENT_POLLS_CHANNEL_ID) {
+        try {
+          // fetch the original to reuse its embed
+          const refs = getMsgRefs(originMessageId);
+          const originRef = refs.find((r) => r.messageId === originMessageId) || refs[0];
+          const ch = originRef ? await client.channels.fetch(originRef.channelId).catch(() => null) : null;
+          const orig = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
+          const baseEmbed = orig?.embeds?.[0] ? EmbedBuilder.from(orig.embeds[0]) : null;
 
-        const pollsCh = await client.channels.fetch(RECRUITMENT_POLLS_CHANNEL_ID).catch(() => null);
-        if (pollsCh && baseEmbed) {
-       const pollsMsg = await pollsCh.send({
-  content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,  // 👈 ping role here too
-  embeds: [baseEmbed],
-  components: rows,
-}).catch(() => null);
+          const pollsCh = await client.channels.fetch(RECRUITMENT_POLLS_CHANNEL_ID).catch(() => null);
+          if (pollsCh && baseEmbed) {
+            const pollsMsg = await pollsCh
+              .send({
+                content: PING_ROLE_ID ? `<@&${PING_ROLE_ID}>` : null,
+                embeds: [baseEmbed],
+                components: [buildObsRowFromDb(originMessageId)],
+              })
+              .catch(() => null);
 
-          if (pollsMsg) {
-            ctx.msgRefs.push({ channelId: pollsCh.id, msgId: pollsMsg.id });
-            obsSessions.set(obsToken, ctx);
-            await reactWith(pollsMsg, VOTE_YES_EMOJI || '✅');
-            await reactWith(pollsMsg, VOTE_NO_EMOJI  || '❌');
+            if (pollsMsg) {
+              addMsgRef(originMessageId, pollsCh.id, pollsMsg.id);
+              await reactWith(pollsMsg, VOTE_YES_EMOJI || '✅');
+              await reactWith(pollsMsg, VOTE_NO_EMOJI || '❌');
+            }
           }
+        } catch (e) {
+          console.error('Polls mirror failed:', e);
         }
       }
 
-      await interaction.reply({ ephemeral: true, content: `✅ Observation ${index} recorded. Use the blue button to view it.` });
+      await interaction.reply({ ephemeral: true, content: `✅ Observation ${idx} recorded. Use the blue button to view it.` });
       return;
     }
-
   } catch (err) {
     console.error(err);
     if (interaction.isRepliable()) {
-      try { await interaction.reply({ ephemeral: true, content: '❌ Something went wrong.' }); } catch {}
+      try {
+        await interaction.reply({ ephemeral: true, content: '❌ Something went wrong.' });
+      } catch {}
     }
   }
 });
