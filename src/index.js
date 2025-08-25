@@ -352,11 +352,28 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-   /* =========================
+  /* =========================
    BACKGROUND CHECK (DB-backed)
    ========================= */
+
+// helper: build actions row based on how many items are selected
+function buildBgActionsRow(originMessageId, selCount) {
+  const row = new ActionRowBuilder();
+  if (selCount === 5) {
+    row.addComponents(
+      new ButtonBuilder().setCustomId(`bg:pass:${originMessageId}`).setLabel('Pass').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('bg:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+    );
+  } else if (selCount >= 0) { // 0..4
+    row.addComponents(
+      new ButtonBuilder().setCustomId(`bg:decline:${originMessageId}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId('bg:cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+    );
+  }
+  return row;
+}
+
 if (interaction.isButton() && interaction.customId === 'bg:start') {
-  // The message being clicked IS the origin
   const originMessageId = interaction.message.id;
 
   const menu = new StringSelectMenuBuilder()
@@ -372,16 +389,11 @@ if (interaction.isButton() && interaction.customId === 'bg:start') {
       { label: 'No major history/MR restrictions', value: 'history' }
     );
 
-  const actions = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`bg:pass:${originMessageId}`).setLabel('Pass').setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(`bg:decline:${originMessageId}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(`bg:cancel`).setLabel('Cancel').setStyle(ButtonStyle.Secondary)
-  );
-
+  // start with ONLY the menu (no Pass/Decline yet)
   await interaction.reply({
     ephemeral: true,
-    content: '**Background check**\nSelect all that **PASS**, then choose **Pass** or **Decline**.',
-    components: [new ActionRowBuilder().addComponents(menu), actions],
+    content: '**Background check**\nSelect all that **PASS**. Buttons will appear once you make a selection.',
+    components: [new ActionRowBuilder().addComponents(menu)],
   });
   return;
 }
@@ -390,9 +402,18 @@ if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu
   const originMessageId = interaction.customId.split(':')[2];
   saveBgSelection(originMessageId, interaction.values);
 
+  const count = interaction.values.length;
+  const menuRow = interaction.message.components[0]; // keep the same menu row
+
+  // replace/append actions row depending on selection count
+  const rows = [menuRow, buildBgActionsRow(originMessageId, count)];
+
   await interaction.update({
-    content: `Selections saved (${interaction.values.length}/5). Choose **Pass** or **Decline** when ready.`,
-    components: interaction.message.components,
+    content:
+      count === 5
+        ? `All **5/5** checks selected. You can **Pass**.`
+        : `Selections saved (**${count}/5**). You can **Decline** or keep selecting.`,
+    components: rows,
   });
   return;
 }
@@ -407,13 +428,11 @@ if (
   (interaction.customId.startsWith('bg:pass:') || interaction.customId.startsWith('bg:decline:'))
 ) {
   const [, action, originMessageId] = interaction.customId.split(':');
-
-  // Use PASS / FAIL for consistency with header text
   const statusWord = action === 'pass' ? 'PASS' : 'FAIL';
   const statusEmoji = action === 'pass' ? '✅' : '❌';
   setBgStatus(originMessageId, statusWord);
 
-  // update original embed field
+  // update original message embed with header "Background Check: PASS/FAIL"
   const ch = interaction.channel;
   const msg = ch ? await ch.messages.fetch(originMessageId).catch(() => null) : null;
   if (!msg) {
@@ -423,35 +442,28 @@ if (
 
   const bg = getBg(originMessageId);
   const selected = JSON.parse(bg.selected_json || '[]');
-  const lines = buildChecklistLinesFromSelected(selected); // array of "✅ 60+ day..." etc.
+  const lines = buildChecklistLinesFromSelected(selected);
 
-  const baseEmbed = msg.embeds?.[0] ? EmbedBuilder.from(msg.embeds[0]) : new EmbedBuilder();
-  const existing = baseEmbed.data.fields ?? [];
-
-  // remove any prior background-check field (title may vary)
-  const nextFields = existing.filter(
-    (f) => !((f.name || '').toLowerCase().startsWith('background check') || (f.name || '').toLowerCase().includes('background check'))
+  const base = msg.embeds?.[0] ? EmbedBuilder.from(msg.embeds[0]) : new EmbedBuilder();
+  const fields = (base.data.fields ?? []).filter(
+    f => !((f.name || '').toLowerCase().startsWith('background check') || (f.name || '').toLowerCase().includes('background check'))
   );
-
-  // put PASS/FAIL in the field header; body is just the checklist
-  const name = `${statusEmoji} Background Check: ${statusWord}`;
-  const value = lines.join('\n');
-
-  nextFields.push({ name, value, inline: false });
-  baseEmbed.setFields(nextFields);
+  fields.push({ name: `${statusEmoji} Background Check: ${statusWord}`, value: lines.join('\n'), inline: false });
+  base.setFields(fields);
 
   if (action === 'pass') {
-    await msg.edit({ embeds: [baseEmbed], components: [buildObsRowFromDb(originMessageId)] });
+    await msg.edit({ embeds: [base], components: [buildObsRowFromDb(originMessageId)] });
   } else {
     const disabledRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('bg:disabled').setLabel('Background check').setStyle(ButtonStyle.Secondary).setDisabled(true)
     );
-    await msg.edit({ embeds: [baseEmbed], components: [disabledRow] });
+    await msg.edit({ embeds: [base], components: [disabledRow] });
   }
 
   await interaction.update({ content: `✅ Background check **${statusWord}** recorded.`, components: [] });
   return;
 }
+
 
 /* =========================
    OBSERVATIONS (3 slots, DB-backed)
