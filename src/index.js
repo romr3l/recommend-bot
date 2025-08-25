@@ -368,9 +368,9 @@ function buildBgActionsRow(originMessageId, selCount) {
       new ButtonBuilder()
         .setCustomId('bg:cancel')
         .setLabel('Cancel')
-        .setStyle(ButtonStyle.Secondary),
+        .setStyle(ButtonStyle.Secondary)
     );
-  } else { // 0..4
+  } else { // 0..4 -> show Decline + Cancel
     row.addComponents(
       new ButtonBuilder()
         .setCustomId(`bg:decline:${originMessageId}`)
@@ -379,27 +379,20 @@ function buildBgActionsRow(originMessageId, selCount) {
       new ButtonBuilder()
         .setCustomId('bg:cancel')
         .setLabel('Cancel')
-        .setStyle(ButtonStyle.Secondary),
+        .setStyle(ButtonStyle.Secondary)
     );
   }
   return row;
 }
 
-// Small guard helpers (use your existing DB getters)
+// Read your existing BG row from DB and decide if it's finalized
 function isBgFinalized(originMessageId) {
   const row = getBg(originMessageId);
   const st = (row?.status || '').toUpperCase();
   return st === 'PASS' || st === 'FAIL';
 }
 
-if (interaction.isButton() && interaction.customId === 'bg:cancel') {
-  await interaction.update({
-    content: '❎ Background check cancelled.',
-    components: []
-  });
-  return;
-}
-
+// Start flow
 if (interaction.isButton() && interaction.customId === 'bg:start') {
   const originMessageId = interaction.message.id;
 
@@ -407,7 +400,7 @@ if (interaction.isButton() && interaction.customId === 'bg:start') {
   if (isBgFinalized(originMessageId)) {
     return interaction.reply({
       ephemeral: true,
-      content: '⚠️ This background check was already completed by someone else..',
+      content: '⚠️ This background check was already completed by someone else.',
     });
   }
 
@@ -421,10 +414,10 @@ if (interaction.isButton() && interaction.customId === 'bg:start') {
       { label: 'No Safechat', value: 'safechat' },
       { label: 'Seen 2+ days by recommender', value: 'seen' },
       { label: 'In communications server', value: 'comms' },
-      { label: 'No major history/MR restrictions', value: 'history' },
+      { label: 'No major history/MR restrictions', value: 'history' }
     );
 
-  // start with ONLY the menu
+  // start with ONLY the menu (buttons appear after first selection)
   await interaction.reply({
     ephemeral: true,
     content: '**Background check**\nSelect all that **PASS**. Buttons will appear once you make a selection.',
@@ -433,7 +426,7 @@ if (interaction.isButton() && interaction.customId === 'bg:start') {
   return;
 }
 
-
+// Save selections and show the right buttons
 if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu:')) {
   const originMessageId = interaction.customId.split(':')[2];
 
@@ -445,13 +438,10 @@ if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu
     });
   }
 
-  // Save current selection
   saveBgSelection(originMessageId, interaction.values);
 
   const count = interaction.values.length;
   const menuRow = interaction.message.components[0]; // keep the same menu row
-
-  // Replace/append actions row depending on selection count
   const rows = [menuRow, buildBgActionsRow(originMessageId, count)];
 
   await interaction.update({
@@ -464,18 +454,20 @@ if (interaction.isStringSelectMenu() && interaction.customId.startsWith('bg:menu
   return;
 }
 
-if (interaction.isButton() && interaction.customId === 'bg:cancel')) {
+// Cancel (single handler — remove any duplicate block)
+if (interaction.isButton() && interaction.customId === 'bg:cancel') {
   await interaction.update({ content: '❎ Background check cancelled.', components: [] });
   return;
 }
 
+// First-wins submit (Pass/Decline)
 if (
   interaction.isButton() &&
   (interaction.customId.startsWith('bg:pass:') || interaction.customId.startsWith('bg:decline:'))
 ) {
   const [, action, originMessageId] = interaction.customId.split(':');
 
-  // **FIRST-WINS GUARD**: if someone already submitted, stop here.
+  // FIRST-WINS GUARD: if someone already submitted, stop here
   if (isBgFinalized(originMessageId)) {
     return interaction.update({
       content: '⚠️ Someone already finalized this background check.',
@@ -521,7 +513,7 @@ if (
         .setCustomId('bg:disabled')
         .setLabel('Background check')
         .setStyle(ButtonStyle.Secondary)
-        .setDisabled(true),
+        .setDisabled(true)
     );
     await msg.edit({ embeds: [base], components: [disabledRow] });
   }
