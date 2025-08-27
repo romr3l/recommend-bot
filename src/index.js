@@ -145,7 +145,36 @@ function haveAllThree(messageId) {
    EPHEMERAL STASH (upload)
    ========================= */
 // Slash -> modal stash (just for the 1-step handoff)
-const pendingProof = new Map();
+// --- Ephemeral stash (15-minute TTL) ---
+const STASH_TTL_MS = 15 * 60_000;
+const pendingProof = new Map(); // token -> { fileName, url, userId, createdAt, timer, expiresAt }
+
+/** Create/overwrite a 15-minute stash with auto-cleanup. */
+function setPending(token, data) {
+  const existing = pendingProof.get(token);
+  if (existing?.timer) clearTimeout(existing.timer);
+  const timer = setTimeout(() => pendingProof.delete(token), STASH_TTL_MS);
+  pendingProof.set(token, { ...data, timer, expiresAt: Date.now() + STASH_TTL_MS });
+}
+
+/** Refresh TTL to full 15 minutes (called when "Continue" is clicked). */
+function refreshPending(token) {
+  const entry = pendingProof.get(token);
+  if (!entry) return null;
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.timer = setTimeout(() => pendingProof.delete(token), STASH_TTL_MS);
+  entry.expiresAt = Date.now() + STASH_TTL_MS;
+  pendingProof.set(token, entry);
+  return entry;
+}
+
+/** Get & delete the stash (cleans its timer) when we finish/cancel. */
+function consumePending(token) {
+  const entry = pendingProof.get(token);
+  if (entry?.timer) clearTimeout(entry.timer);
+  if (entry) pendingProof.delete(token);
+  return entry || null;
+}
 
 /* =========================
    HELPERS
@@ -231,13 +260,13 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       const token = interaction.id;
-      pendingProof.set(token, {
-        fileName: proof.name ?? 'proof.png',
-        url: proof.url,
-        userId: interaction.user.id,
-        createdAt: Date.now(),
-      });
-      setTimeout(() => pendingProof.delete(token), 3 * 60_000);
+setPending(token, {
+  fileName: proof.name ?? 'proof.png',
+  url: proof.url,
+  userId: interaction.user.id,
+  createdAt: Date.now(),
+});
+      
 
       const req = [
         'Hey, Supervisors! Welcome to the Management Recommendations form, here you will be able to recommend some hard working Experienced Staff, please make sure that they follow the following criteria before you officially recommend them.',
@@ -266,10 +295,10 @@ client.on('interactionCreate', async (interaction) => {
     /* ------- continue -> modal ------- */
     if (interaction.isButton() && interaction.customId.startsWith('recommend:continue:')) {
       const token = interaction.customId.split(':')[2];
-      const stash = pendingProof.get(token);
-      if (!stash || stash.userId !== interaction.user.id) {
-        return interaction.reply({ ephemeral: true, content: '❌ Session expired. Please run `/recommend` again.' });
-      }
+      const stash = refreshPending(token); // refresh the 15-min TTL
+if (!stash || stash.userId !== interaction.user.id) {
+  return interaction.reply({ ephemeral: true, content: '❌ Session expired. Please run `/recommend` again.' });
+}
 
       const modal = new ModalBuilder().setCustomId(`recommend_modal:${token}`).setTitle('Recommendation');
 
@@ -303,10 +332,10 @@ client.on('interactionCreate', async (interaction) => {
     /* ------- modal submit -> post recommendation ------- */
     if (interaction.isModalSubmit() && interaction.customId.startsWith('recommend_modal:')) {
       const token = interaction.customId.split(':')[1];
-      const stash = pendingProof.get(token);
-      if (!stash || stash.userId !== interaction.user.id) {
-        return interaction.reply({ ephemeral: true, content: '❌ Session expired. Please run `/recommend` again.' });
-      }
+      const stash = consumePending(token); // atomically fetch & clear
+if (!stash || stash.userId !== interaction.user.id) {
+  return interaction.reply({ ephemeral: true, content: '❌ Session expired. Please run `/recommend` again.' });
+}
 
       const lrUsername = interaction.fields.getTextInputValue('lr_username').trim();
       const reason = interaction.fields.getTextInputValue('reason').trim().slice(0, 1024);
@@ -347,7 +376,7 @@ client.on('interactionCreate', async (interaction) => {
       // track original message as a ref so we can edit later
       addMsgRef(sent.id, sent.channelId, sent.id);
 
-      pendingProof.delete(token);
+      consumePending(token);
       await interaction.reply({ ephemeral: true, content: '✅ Recommendation sent to the Recruitment Department. Thanks!' });
       return;
     }
